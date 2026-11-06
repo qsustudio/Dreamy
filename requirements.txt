@@ -1,0 +1,31 @@
+# Dreamy 运行时依赖
+#
+# 注意：torch 不在这里列出。
+#   Colab / T4 需要按 CUDA 版本选择 wheel，由 colab_train.ipynb 负责安装：
+#       pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu126
+#   本地开发机装 CPU 版：
+#       pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   这样避免 requirements 把 torch 钉死成某个 CUDA 构建。
+
+# ---- 核心模型库 ----
+# x-transformers：锁定版本，避免上游 API 快速变动导致 Colab 行为不一致
+x-transformers==2.31.11
+
+# 它的运行时依赖（pip 会自动带，这里显式列出便于审查）
+einx>=0.3.0
+einops>=0.8.0
+loguru
+torch-einops-utils>=0.1.41
+
+# ---- 训练辅助 ----
+numpy
+tqdm
+# 可选：把指标记录到 TensorBoard（Colab 里 %tensorboard 可直接看）
+tensorboard
+
+# ---- 示例/训练脚本可能用到（x-transformers 的 examples extra）----
+adam-atan2-pytorch>=0.2.2
+lion-pytorch
+
+# ---- 开发/测试 ----
+pytest

@@ -1,0 +1,103 @@
+# ============================================================
+# Dreamy - Git 忽略规则
+# 原则：仓库只放源码和配置。环境、依赖、数据、缓存一律不进仓库。
+# ============================================================
+
+# ---------------- Python 虚拟环境 ----------------
+.venv/
+.venv-*/
+venv/
+env/
+ENV/
+
+# ---------------- 第三方库源码（用 pip 安装，不作为项目代码提交）----------------
+# x-transformers 是 lucidrains 的库，通过 requirements.txt 安装
+x-transformers/
+vendor/
+
+# ---------------- Python 缓存 / 构建产物 ----------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# ---------------- 测试与工具缓存 ----------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# ---------------- 本地下载的 wheel / 离线包 ----------------
+.wheels/
+.tmp/
+*.whl
+
+# ---------------- 训练数据与模型权重（走 Google Drive，不进仓库）----------------
+data/
+datasets/
+dataset/
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.gz
+*.zip
+*.tar
+*.tgz
+*.h5
+*.hdf5
+*.parquet
+*.arrow
+*.jsonl
+
+# 模型输出 / 训练日志
+runs/
+outputs/
+checkpoints/
+logs/
+wandb/
+lightning_logs/
+*.log
+
+# ---------------- 密钥 / 凭据（绝对不能提交）----------------
+.env
+.env.*
+!.env.example
+secrets.json
+credentials.json
+token.json
+*.pem
+*.key
+client_secret*.json
+kaggle.json
+
+# ---------------- Colab / Jupyter ----------------
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+
+# ---------------- 操作系统 / 编辑器 ----------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---------------- 杂项 ----------------
+.cache/
