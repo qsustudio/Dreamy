@@ -27,5 +27,11 @@ tensorboard
 adam-atan2-pytorch>=0.2.2
 lion-pytorch
 
+# ---- 数据处理（从零训练必需）----
+# 配比配置
+pyyaml
+# 中文 tokenizer：从零训练必须先训练词表
+sentencepiece
+
 # ---- 开发/测试 ----
 pytest

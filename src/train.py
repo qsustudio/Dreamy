@@ -10,6 +10,7 @@ checkpoint 和日志写回 DREAMY_OUT_DIR（Colab 上通常指向 Drive，
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import sys
@@ -104,6 +105,25 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     cfg.paths.ensure()
+
+    # ---- 从数据目录的 meta.json 自动对齐词表和序列长度 ----
+    # build_dataset.py --tokenize 会写出 meta.json，
+    # 如果模型 num_tokens 和 tokenizer 词表对不上，训练会在 embedding 处报错。
+    meta_path = os.path.join(cfg.paths.data_dir, "meta.json")
+    if os.path.isfile(meta_path):
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+        if "vocab_size" in meta:
+            if cfg.model.num_tokens != meta["vocab_size"]:
+                print(f"按 meta.json 对齐词表: num_tokens "
+                      f"{cfg.model.num_tokens} -> {meta['vocab_size']}")
+            cfg.model.num_tokens = int(meta["vocab_size"])
+        if meta.get("seq_len"):
+            cfg.model.max_seq_len = int(meta["seq_len"])
+    else:
+        print(f"[!] {meta_path} 不存在，沿用配置里的 "
+              f"num_tokens={cfg.model.num_tokens}。"
+              f"若词表和模型不匹配会报错，建议用 build_dataset.py --tokenize 生成数据。")
 
     # ---- 数据 ----
     print(f"\n从 {cfg.paths.data_dir} 加载数据 ...")
