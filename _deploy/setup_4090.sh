@@ -87,11 +87,28 @@ for i in range(torch.cuda.device_count()):
     arch = f"sm_{cap[0]}{cap[1]}"
     name = torch.cuda.get_device_name(i)
     props = torch.cuda.get_device_properties(i)
-    ok = arch in torch.cuda.get_arch_list()
-    print(f"  gpu{i}   : {name} | {arch} | {props.total_memory/2**30:.0f}GB "
-          f"| kernel {'OK' if ok else 'MISSING'}")
-    if not ok:
-        print(f"  [x] 当前 torch 构建不含 {arch} 的 kernel")
+    # 注意：不能只用 arch in get_arch_list() 判断。
+    # CUDA 二进制兼容规则是「X.y 的 kernel 能跑在 X.z (z>=y)」，
+    # 4090 是 sm_89，跑 sm_86 的 kernel 完全没问题。
+    # 最终判据改成真的跑一次 matmul。
+    archs = torch.cuda.get_arch_list()
+    compatible = any(
+        a.startswith("sm_") and a[3] == arch[3] and int(a[4:].rstrip("abcdef")) <= cap[1]
+        for a in archs
+    )
+    try:
+        xx = torch.randn(256, 256, device=f"cuda:{i}")
+        torch.mm(xx, xx)
+        torch.cuda.synchronize(i)
+        run_ok = True
+        err = ""
+    except Exception as e:
+        run_ok = False
+        err = str(e)[:120]
+    state = "kernel OK" if run_ok else f"kernel FAILED: {err}"
+    print(f"  gpu{i}   : {name} | {arch} | {props.total_memory/2**30:.0f}GB | {state}")
+    if not run_ok:
+        print("  [x] 当前 torch 跑不动这张卡，请装匹配的 CUDA 版本")
         sys.exit(1)
 
 bf16 = torch.cuda.is_bf16_supported()

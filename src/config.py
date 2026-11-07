@@ -17,8 +17,11 @@ from pathlib import PurePosixPath
 # Colab 上挂载后的默认位置；本地跑时用环境变量指到本地目录。
 # 用 POSIX 风格拼接，保证打印出来在 Linux/Windows 上都是同一个样子
 # （Windows 也接受正斜杠）。
-DEFAULT_DATA_DIR = "/content/drive/MyDrive/dreamy/data"
-DEFAULT_OUT_DIR = "/content/drive/MyDrive/dreamy/runs"
+# 默认用「项目内相对路径」，不再假设 Colab 的 /content/drive。
+# 换机器（Colab / 本地 / 实验室 4090）都不用改代码。
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_DATA_DIR = os.path.join(_PROJECT_ROOT, "data", "processed")
+DEFAULT_OUT_DIR = os.path.join(_PROJECT_ROOT, "runs")
 
 
 def _join(base: str, *parts: str) -> str:

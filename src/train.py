@@ -88,14 +88,14 @@ def setup(args, cfg):
     print("=" * 66)
 
     if device.type == "cuda":
-        cap = torch.cuda.get_device_capability(0)
-        arch = f"sm_{cap[0]}{cap[1]}"
-        if arch not in torch.cuda.get_arch_list():
+        from model import cuda_runnable
+        ok, err = cuda_runnable(0)
+        if not ok:
             raise SystemExit(
-                f"当前 torch 构建不含 {arch} 的 kernel，无法在该 GPU 上运行。\n"
-                f"T4 需要 sm_75 —— 请改装 cu126 版：\n"
-                f"  pip install torch==2.14.1 --index-url "
-                f"https://download.pytorch.org/whl/cu126"
+                f"GPU 无法运行当前 torch 构建：{err}\n"
+                f"请安装与该 GPU 匹配的 CUDA 版本 torch，例如 4090/4090 系：\n"
+                f"  pip install torch==2.14.1 "
+                f"--index-url https://download.pytorch.org/whl/cu126"
             )
 
     cfg.paths.ensure()
