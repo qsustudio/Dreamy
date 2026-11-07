@@ -10,17 +10,47 @@ from x_transformers import TransformerWrapper, Decoder, AutoregressiveWrapper
 from config import ModelConfig
 
 
-def build_model(cfg: ModelConfig) -> TransformerWrapper:
-    """构建 Dreamy-36M。
+def align_heads(cfg: ModelConfig) -> ModelConfig:
+    """把 heads 和 dim / head_dim 对齐。
 
-    对应 spec v1.1 的架构表：
-        Decoder-only / RoPE / RMSNorm / Pre-Norm / SwiGLU / Weight Tying
-
-    几个必须显式打开的开关（默认值会让参数量对不上）：
-        ff_glu=True       -> SwiGLU，不开只有 29.4M（开了 35.69M）
-        tie_embedding=True-> 输出头和 embedding 共享，省 8.39M
-        use_abs_pos_emb=False + rotary_pos_emb=True  用 RoPE 不用绝对位置编码
+    `--dim 832 --depth 12` 这种写法很容易漏掉 `--heads`：heads 还是 12、
+    head_dim 64，12×64=768 ≠ 832。x-transformers 遇到 inner_dim != dim
+    不会报错，而是默默多插一个投影层 —— 参数量、速度、显存全都和预期不一样。
+    这里直接按 dim/head_dim 纠正，并明确打出来。
     """
+    if cfg.heads * cfg.head_dim == cfg.dim:
+        return cfg
+    if cfg.dim % cfg.head_dim == 0:
+        new_heads = cfg.dim // cfg.head_dim
+        print(f"[!] heads({cfg.heads})×head_dim({cfg.head_dim})="
+              f"{cfg.heads * cfg.head_dim} 与 dim({cfg.dim}) 不匹配，"
+              f"自动改成 heads={new_heads}（即 dim/head_dim）")
+        cfg.heads = new_heads
+        return cfg
+    raise ValueError(
+        f"dim={cfg.dim} 不能被 head_dim={cfg.head_dim} 整除："
+        f"请显式给出匹配的 --heads / --head-dim"
+        f"（当前 heads={cfg.heads}, head_dim={cfg.head_dim}）")
+
+
+def build_model(cfg: ModelConfig) -> TransformerWrapper:
+    """构建 Dreamy。
+
+    架构：Decoder-only / RoPE / RMSNorm / Pre-Norm / SwiGLU / 权重共享
+
+    必须显式打开的开关（默认值会让参数量或速度不对）：
+        ff_glu=True         -> SwiGLU。不开只有 99.2M（开了 110.18M）
+        tie_embedding=True  -> 输出头和 embedding 共享，省 25.2M
+        use_abs_pos_emb=False + rotary_pos_emb=True  用 RoPE
+
+    v1.1 新增（关键）：
+        attn_flash=True     -> 走 F.scaled_dot_product_attention 融合实现。
+                               不开的话注意力矩阵会被完整物化，
+                               显存暴涨且 MFU 只有 15%。
+        attn_qk_norm=True   -> QK-Norm，训练更稳，可用更高学习率
+        zero_init_branch_output=True -> 残差分支零初始化
+    """
+    cfg = align_heads(cfg)
     return TransformerWrapper(
         num_tokens=cfg.num_tokens,
         max_seq_len=cfg.max_seq_len,
@@ -39,6 +69,10 @@ def build_model(cfg: ModelConfig) -> TransformerWrapper:
             ff_dropout=cfg.dropout,
             ff_mult=cfg.ffn_mult,
             ff_glu=cfg.ffn_glu,
+            # ---- v1.1 ----
+            attn_flash=getattr(cfg, "use_flash", True),
+            attn_qk_norm=getattr(cfg, "qk_norm", True),
+            zero_init_branch_output=getattr(cfg, "zero_init_branch", True),
         ),
     )
 

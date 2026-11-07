@@ -1,0 +1,306 @@
+# Dreamy v2 训练方案（RTX 5090 32G / ≤10 小时）
+
+> 目标：在一张 5090 上、**10 小时以内**、把 32G 显存和 1792GB/s 带宽榨干，
+> 训出比 v1.0 明显更好的中文陪伴对话基座。
+> 日期：2026-11-08 上午执行。
+
+---
+
+## 一、一页结论
+
+| 项目 | v1.0（4090 实际跑完） | **v2（5090 计划）** | 倍数 |
+| --- | --- | --- | --- |
+| 参数量 | 110.1M | **127.0M**（dim 832 / depth 12 / heads 13） | 1.15× |
+| 训练 token | 0.62B | **2.40B** | **3.9×** |
+| D/N（训练充分度） | 5.7（严重欠训练） | **18.9（接近 Chinchilla 20）** | 3.3× |
+| 上下文 | 1024 | 1024（不变，够 8-12 轮对话） | — |
+| 词表 | 32768 | 32768（**不重训 tokenizer**） | — |
+| 注意力 | 手写（物化 S×S 矩阵） | Flash/SDPA（`attn_flash=True`） | — |
+| 词表外其他 | — | qk_norm、zero_init_branch、dropout 0 | — |
+| 训练时长 | ~5.3h | **9.0h 训练 + 1h 余量** | — |
+
+**这一轮的收益主要来自数据，不是参数。**
+v1.0 只喂了 0.62B token，D/N=5.7，模型远没训练充分 —— 这才是 v1 质量的天花板。
+参数从 110M 到 127M 只值 ~0.04 nat，而 token 从 0.62B 到 2.4B 值 ~0.3 nat。
+
+---
+
+## 二、为什么是 127M / 2.4B（不是 300M，也不是 145M）
+
+### 2.1 硬约束
+
+训练时长固定 10h ⇒ 能花掉的算力固定：
+
+```
+C = 有效峰值 × 时间 = 6 · N · D · f
+```
+
+- 5090 BF16 dense 峰值 = **209.5 TFLOPS**（Tensor Core 419 sparse / 2，FP32 104.8 × 2）
+- f = 注意力额外开销系数 = `1 + 2·S·dim·depth/N`
+  （业界常用的 6ND 只算线性层；S=1024 时注意力还要多花 15~18%，**不修正会高估 15% 的 token 量**）
+
+### 2.2 三档配置实测推算
+
+| 配置 | 参数 | f | FLOP/token | MFU 25% | MFU 30% | MFU 35% | 2.4B 耗时(30%) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| A `768/12/12` | 110.1M | 1.17 | 0.774 GF | 67.7k tok/s | 81.3k | 94.8k | 8.2h |
+| **B `832/12/13`** | **127.0M** | **1.16** | **0.885 GF** | **59.2k** | **71.1k** | **82.9k** | **9.4h** |
+| C `896/12/14` | 145.0M | 1.15 | 1.002 GF | 52.3k | 62.7k | 73.2k | 10.6h ✗ |
+
+**B 是唯一在整个 25%~40% MFU 区间都能吃掉 80% 以上数据的配置。**
+
+### 2.3 明天怎么两分钟内定死
+
+上机后先跑 200 步实测（`scripts/bench_throughput.py`），把实测 tok/s 换算成 MFU：
+
+```
+MFU = tok/s × 6 × N × f / 209.5e12
+```
+
+| 实测 MFU | 选这个 | 2.4B 预计耗时 |
+| --- | --- | --- |
+| < 28% | A `768/12/12`（110.1M） | 8.8~9.8h |
+| **28% ~ 35%** | **B `832/12/13`（127.0M）** | **8.0~9.4h** |
+| > 35% | C `896/12/14`（145.0M） | 9.1h |
+
+三档之间的 loss 差距在 0.05 nat 以内（<5% 困惑度），**不要在这上面纠结**；
+真正决定成败的是「2.4B token 能不能在 10h 内训完」。
+
+---
+
+## 三、数据配比（实测池子 + 重复轮数）
+
+### 3.1 本地实测可用量（`scripts/report_pools.py` 全量扫描）
+
+| 类别 | 来源 | 可清洗出 | v1 已用 | v2 预算(2.4B×占比) | 重复轮数 |
+| --- | --- | --- | --- | --- | --- |
+| general | opencsg/chinese-fineweb-edu (Skypile) | **1.69B** | 0.64B | 1.26B | 0.75× |
+| chat | silver/lccc | 0.222B | 0.222B | 0.456B | 2.05× |
+| knowledge | wanng/wikipedia-zh-mnbvc | 0.156B | 0.156B | 0.336B | 2.15× |
+| depth | Mxode/Chinese-Instruct 关键词分流 | 0.099B | 0（v1 权重为 0） | 0.168B | 1.70× |
+| empathy | 同上 | 0.042B | 0.042B | 0.144B | 3.43× |
+| safety | 同上 | 0.011B | 0.011B | 0.036B | 3.27× |
+| **合计** | | **2.22B** | 1.07B | **2.40B** | 平均 1.1× |
+
+> general 的 1.69B 是「全部 12 个原始分片都清洗完」的估计值：
+> 已清洗 6 个分片得到 1.368B 字符，原始→清洗保留率 83%，剩 6 个分片同理。
+
+**关键判断：数据基本够，不需要靠大量重复硬凑。**
+平均重复 1.1 轮，最狠的 empathy 3.4 轮 —— 都远在 4 轮无损线以内
+（Muennighoff et al. 2023：≤4 epochs 近似等價于新数据）。
+
+### 3.2 配比本身（`configs/mix.yaml` → `pretrain_v2`）
+
+```
+general   0.525   # 语言 + 世界知识的地基，唯一有富余的类
+chat      0.19    # 对话形态（LCCC 短浅，占比不能再高）
+knowledge 0.14    # 百科/事实，抑制胡说
+depth     0.07    # 深度讨论/反思 —— v2 新增，对应"有深度"
+empathy   0.06    # 情绪交流 —— 陪伴的差异化能力
+safety    0.015   # 安全边界
+max_epochs 4.0    # 单类重复硬上限，超了就报错要求补数据
+```
+
+**和 v1 的差别：**
+1. **depth 加回来**（v1 权重是 0，等于把 15 万条深度讨论数据白扔了）
+2. **general 不再兜底**。v1 配比写 0.50，实际跑出来 0.60 —— 因为 chat/knowledge/empathy/safety
+   全部提前耗尽，general 被迫填坑，结果模型更像"网页文章"。
+   v2 改成**稀缺类超采样**，缺口不再甩给 general。
+3. 安全类占比降低，因为它的数据量最小（0.011B），却要靠重复 3.3 轮才够；
+   这一类的塑形主要交给 SFT 阶段。
+
+### 3.3 代码已支持（本次改动）
+
+- `build_dataset_streaming.py` 新增 `--mix-key pretrain_v2`、`--max-epochs`、`--plan-only`
+- **超采样**：某类不够预算时循环重复整类，而不是降低占比
+- **重复上限**：超过 `max_epochs` 截断，缺口按剩余产能分摊，分摊也分轮做（不会把接收方也顶爆）
+- **续清洗防重复**：`--reuse-shards` 时会跳过已处理过的原始文件
+  （旧版会从第一个文件重读，直接把数据洗成重复的 —— 这是个隐藏 bug，已修）
+- `meta.json` 现在记录 `epochs_used`，能直接看出每类重复了几轮
+
+---
+
+## 四、今晚要做的事
+
+### 4.0 时间预算
+
+| 步骤 | 预计耗时 | 能不能并行 |
+| --- | --- | --- |
+| 补数据下载（可选） | 0.5~2h | 可以和清洗并行 |
+| 清洗 + 打包 2.4B token | **2~4h**（MinHash 是瓶颈） | 只能顺序 |
+| 传数据到 5090 机器 | 15~40min | — |
+
+> 清洗是今晚最贵的一步，**越早开始越好**。可以先不清 depth/general 增量，
+> 用 `--plan-only` 先把预算表跑出来看数。
+
+### 4.1 先自检预算（秒级，不清洗）
+
+```bash
+python scripts/report_pools.py --include-raw
+```
+
+### 4.2 正式构建（今晚跑，明早直接用）
+
+```bash
+python -u scripts/build_dataset_streaming.py \
+  --stage pretrain \
+  --mix-key pretrain_v2 \
+  --reuse-shards \
+  --tokenize \
+  --max-chars 3890000000
+```
+
+- `--max-chars 3890000000` = 38.9 亿字符 ≈ **2.40B token**
+- `--reuse-shards` 复用已有 5 类分片，只补洗 general 剩余分片 + depth
+- **不要加 `--retrain-tokenizer`**：词表必须和 v1 一致（32768），重训会导致
+  和既有 SFT 数据/词表不匹配
+- 预计输出 `tokens.bin` ≈ **4.8GB**，`val_tokens.bin` ≈ 48MB
+
+跑完检查 `data/processed/meta.json`：
+`num_tokens` 应 ≈ 2.4B，`epochs_used` 应全部 ≤ 3.5。
+
+### 4.3 可以顺手清理
+
+```bash
+# 旧的混合版（1.94GB），v2 构建不再使用
+rm data/processed/pretrain_mixed.jsonl
+```
+
+---
+
+## 五、明早的执行顺序
+
+### 步骤 0：环境（一次性，~20 分钟）
+
+```bash
+# 5090 = sm_120，必须 CUDA 13 + torch 2.14.1；cu126 完全不支持 Blackwell
+bash _deploy/setup_5090.sh
+```
+
+脚本会自动检测 compute capability 并选对 CUDA 版本，然后打印
+`torch.cuda.get_arch_list()` 和一次真实 matmul 自检。
+**如果自检不通过就别往下走**，回来找我。
+
+### 步骤 1：传数据
+
+`tokens.bin`(4.8G) + `val_tokens.bin`(48M) + `tokenizer.model` + `meta.json` + SFT 三个文件。
+
+### 步骤 2：200 步实测（关键，别跳过）
+
+```bash
+python -u scripts/bench_throughput.py \
+  --dim 832 --depth 12 --heads 13 --head-dim 64 --seq-len 1024 \
+  --batch-size 16 --grad-accum 2 \
+  --steps 60 --warmup 10 --sweep 8,16,24,32 \
+  --peak-tflops 209.5 --hours 10 --reserve-hours 1
+```
+
+它直接打印：实测 tok/s、反推 MFU、每档 micro-batch 的显存/吞吐、10h 能训多少 token、
+以及**可以直接复制的训练命令**（`--max-steps` 已经按 10h 算好）。
+拿这个结果对照第二节 2.3 的表决定用 A / B / C —— 如果要换尺寸，重跑一次
+bench 换 `--dim/--depth/--heads` 即可。
+
+### 步骤 3：正式训练
+
+```bash
+# 用全新 out-dir，避免踩到旧 run 残留的 model_config.json
+python -u src/train.py --stage pretrain \
+  --out-dir runs_v2 \
+  --dim 832 --depth 12 --heads 13 --head-dim 64 --seq-len 1024 \
+  --batch-size 16 --grad-accum 2 \
+  --lr 4e-4 --warmup-ratio 0.014 \
+  --max-steps <bench 给的值> \
+  --eval-every 2000 --eval-batch-size 8 --eval-batches 64 \
+  --ckpt-every 2000
+```
+
+> - `--heads` 就算漏传也不会错：`src/model.py` 会按 `dim/head_dim` 自动纠正并提示
+> - **用全新 `--out-dir`**：架构解析优先级是 `ckpt → out_dir/model_config.json → 命令行`，
+>   旧的 `runs/` 里如果留着 110M 的配置，会被当成默认值（虽然 CLI 会覆盖，但没必要踩）
+> - `--ckpt-every 2000` ≈ 每 11 分钟存一次，掉电最多损失 11 分钟
+> - `--resume auto` 挂了直接重跑同一条命令，**不用再传尺寸**（按 ckpt 里的架构自动重建）
+
+### 步骤 4：SFT（约 20-30 分钟）
+
+```bash
+# SFT 数据由另一个脚本处理（它的编排逻辑和预训练不同：按条数、要构造 labels）
+python -u scripts/build_dataset.py --stage sft --tokenize
+python -u src/train.py --stage sft --out-dir runs_v2 \
+  --init-from runs_v2/checkpoints/pretrain_last.pt \
+  --max-steps <2-3 epoch 对应步数> --lr 5e-5
+```
+
+> SFT 只有 3300 万 token，5090 上 2-3 epoch 也就十几分钟。
+> **`--init-from` 会自动按 pretrain ckpt 里的架构重建模型**，尺寸参数一个都不用传。
+> 模型尺寸如果和 pretrain 不一致会直接报错并列出差异，不会错位加载。
+
+**时间分配**：pretrain 9.0h + SFT 0.4h + 存盘/重启余量 0.6h = 10.0h。
+
+---
+
+## 六、把 5090 榨干的清单
+
+### 已经做的
+
+| 手段 | 收益 | 状态 |
+| --- | --- | --- |
+| `attn_flash=True`（SDPA `is_causal`） | **2.3×**（v1 的 MFU 只有 15%，因为它物化了 [B,H,S,S]） | ✓ v1.1 |
+| `qk_norm` + `zero_init_branch` | 允许更高 LR，收敛更稳 | ✓ v1.1 |
+| dropout = 0 | 欠训练阶段 dropout 纯拖慢 | ✓ v1.1 |
+| bf16（不是 fp16） | 免 GradScaler，黑维尔 bf16 原生 | ✓ |
+
+### 明天要做的
+
+| 手段 | 预期收益 | 备注 |
+| --- | --- | --- |
+| **micro-batch 尽量大**（16→24→32 扫一遍） | 3~8% | flash 后注意力不物化，32G 能开很大 |
+| **fused AdamW** | 3~6% | 小模型上优化器占比不小 |
+| `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | 防碎片 OOM | 已在 train.py 里设置 |
+| `allow_bf16_reduced_precision_reduction` | 1~3% | bf16 GEMM 规约更快 |
+| 关掉每步 `synchronize()`，用 CUDA Event 计时 | 1~2% | — |
+
+### 不要做的
+
+- ❌ **梯度检查点**：32G 显存放得下 127M + batch 16，开 checkpointing 只会慢 30%
+- ❌ **`torch.compile`**：sm_120 上还不稳，可能吃 10 分钟编译还不返工，收益 10% 不值得冒险
+- ❌ **fp8**：5090 支持，但 x-transformers 没接，改造风险远大于收益
+- ❌ **加大 seq_len**：用户明确不需要长上下文，而且注意力是 O(S²)，
+  1024→2048 在 127M 上要多吃 30% 算力
+
+---
+
+## 七、风险与回退
+
+| 风险 | 概率 | 影响 | 应对 |
+| --- | --- | --- | --- |
+| cu130/torch 装不上或 sm_120 跑不起来 | 中 | 致命 | `setup_5090.sh` 会自动降到 cu128 + torch 2.11；实在不行换 cu128 三件套 |
+| 实测 MFU < 25%（租赁卡降频） | 中 | 少训 30% 数据 | 换 A 档 110M，或者接受 1.9B token |
+| 4e-4 学习率发散 | 低 | 浪费时间 | qk_norm 兜着；前 1000 步盯 loss，异常就 3e-4 重开 |
+| 清洗没跑完 | 中 | 数据不够 | 用 `--max-chars` 缩小目标（下限 2.0B token = 3.25B 字符） |
+| 数据传不上去 | 低 | 卡住 | 提前分卷（`scripts/export_model.py` 有现成的 MD5+分卷逻辑可复用） |
+| 训练中途挂掉 | 中 | 损失 ≤11min | `--ckpt-every 2000` + `--resume auto` |
+
+---
+
+## 八、这一轮不做什么（避免范围失控）
+
+- ❌ 不做多轮长上下文 / 思维链 —— 用户明确不需要
+- ❌ 不换 tokenizer 词表 —— 收益 ~1%，风险是整条数据链重刷
+- ❌ 不做 MoE —— 127M 规模下专家路由只有害无益
+- ❌ 不追求 300M+ 参数 —— 10 小时算力只能喂 2.4B token，
+  300M 会变成 D/N=8 的欠训练，效果反而不如 127M
+
+---
+
+## 附：关键数字速查
+
+```
+5090: 170 SM / 21760 CUDA core / 2.41GHz / 1792 GB/s / 32GB GDDR7 / 575W
+      BF16 dense = 209.5 TFLOPS
+      sm_120 → 必须 CUDA ≥ 12.8，推荐 CUDA 13 + torch 2.14.1
+
+127.0M (832/12/13/64) : f=1.161, 6Nf=0.885 GF/token
+2.40B token           : = 3.89B 字符（中文字/token ≈ 0.617）
+32,768 tok/step       : 2.4B → 73,242 步
+Chinchilla 参考        : D/N=20 最优；本方案 D/N=18.9
+```

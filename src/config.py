@@ -60,10 +60,36 @@ class Paths:
 
 @dataclass
 class ModelConfig:
-    """Dreamy-110M（RTX 4090 版本）。
+    """Dreamy-110M v1.1（5090 32G / 4090 24G 通用）。
 
-    实测参数量 110M。8h 4090 预算下正好落在 Chinchilla 最优附近
-    （N≈118M, D≈2.35B @ MFU 35%）。
+    v1.1 改动 —— 参数量不变（110.18M），但训练效率和稳定性大幅提升：
+
+    1. use_flash=True（最大收益）
+       v1.0 默认 flash=False，x-transformers 走手写注意力，
+       会把 [batch, heads, seq, seq] 的注意力矩阵完整物化：
+         - 显存暴涨（4090 上 micro batch 8 就 OOM）
+         - MFU 只有 15%（实测 32.7k tok/s）
+       打开后走 F.scaled_dot_product_attention(is_causal=True)，
+       即 PyTorch 原生融合注意力，不需要额外装 flash-attn 包。
+
+    2. qk_norm=True
+       attention 的 q/k 做 RMSNorm，logits 不发散，
+       可以用更高学习率，收敛更快更稳。
+
+    3. zero_init_branch=True
+       残差分支输出初始化为 0，起步更像恒等映射。
+
+    4. dropout 0.05 -> 0
+       v1.0 只训了 0.62B token（D/N=5.7），严重欠训练，
+       轮不到过拟合，dropout 只会拖慢收敛。
+
+    尺寸说明（D/N = 训练 token / 参数量，Chinchilla 最优约 20）：
+      110M 需约 2.2B token 才训练充分。v1.0 只喂了 0.62B，
+      这是质量受限的主因，不是架构问题 —— 不加数据就加大参数只会更欠训练。
+
+    要换更大尺寸（32G 显存 + 数据足够时）：
+      dim=896,  heads=14 -> 145M（需约 2.9B token）
+      dim=1024, heads=16 -> 185M（需约 3.7B token）
     """
     num_tokens: int = 32768     # 词表：中文压缩率比 16k 好约 15%
     max_seq_len: int = 1024     # 可覆盖 8-12 轮对话
@@ -73,21 +99,23 @@ class ModelConfig:
     head_dim: int = 64          # Head Dimension
     ffn_mult: float = 8 / 3     # SwiGLU 标准比例，hidden = 2048
     ffn_glu: bool = True        # SwiGLU
-    dropout: float = 0.05
+    dropout: float = 0.0        # v1.1 关掉（欠训练阶段）
 
-    # 为什么从 36M 提到 110M：
-    #   4090 算力是 T4 的 2.54x、带宽 3.15x，8h 能跑 2.15B token。
-    #   Chinchilla 最优 N = sqrt(C/120) ≈ 118M，110M 正好贴合。
-    #   原来的 36M/400M 方案只有 D/N=10.6，属于严重欠训练。
+    # ---- v1.1 优化开关 ----
+    use_flash: bool = True          # 融合注意力
+    qk_norm: bool = True            # QK-Norm
+    zero_init_branch: bool = True   # 残差分支零初始化
 
 
 @dataclass
 class TrainConfig:
     # 有效 batch = micro_batch * seq_len * grad_accum
-    # 24GB 显存下 110M 模型固定开销只有 1.3GB，micro batch 可以开到 16
-    # 16 * 1024 * 1 = 16,384 token/step
-    batch_size: int = 16        # micro batch
-    grad_accum: int = 1
+    # 开了融合注意力后显存大幅下降（不再物化注意力矩阵）：
+    #   4090 24G : batch 8  起步，可试 12-16
+    #   5090 32G : batch 16 起步，可试 24-32
+    # 8 * 1024 * 2 = 16,384 token/step（与 v1.0 有效 batch 一致）
+    batch_size: int = 8         # micro batch
+    grad_accum: int = 2
     lr: float = 3e-4
     weight_decay: float = 0.1
     beta1: float = 0.9

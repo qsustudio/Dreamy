@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import sys
@@ -85,13 +86,52 @@ def build_clean_config(q: dict, document: bool, lenient: bool) -> CleanConfig:
     )
 
 
-def shard_chars(shards: list[str]) -> int:
-    """统计已有分片里的字符数。"""
-    total = 0
+def shard_stats(shards: list[str]) -> tuple[int, int]:
+    """统计已有分片里的 (字符数, 条数)。"""
+    chars = 0
+    items = 0
     for sh in shards:
         for conv in read_jsonl(sh):
-            total += conv.total_chars
-    return total
+            chars += conv.total_chars
+            items += 1
+    return chars, items
+
+
+def last_consumed_source(shards: list[str]) -> str | None:
+    """最后一个已有分片对应的原始文件名。
+
+    续清洗时必须知道上次读到哪个原始文件了 —— 否则会从第一个文件
+    重新读一遍，把已经清洗过的数据再洗一次写一遍，数据直接重复。
+    """
+    if not shards:
+        return None
+    with open(shards[-1], encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            return (rec.get("meta") or {}).get("source")
+    return None
+
+
+def resume_files(files: list[str], existing: list[str]) -> tuple[list[str], int]:
+    """续清洗时跳过已经写过分片的原始文件。
+
+    整份跳过而不是"从中间接着读"：文件里被打断的位置没有记录，
+    宁可少要一个文件尾巴（几千万字符），也不要引入重复数据。
+    """
+    last = last_consumed_source(existing)
+    if last is None:
+        return files, 0
+    names = [os.path.basename(f) for f in files]
+    if last not in names:
+        return files, 0
+    idx = names.index(last) + 1
+    return files[idx:], idx
 
 
 def list_existing_shards(shard_dir: str) -> list[str]:
@@ -99,6 +139,18 @@ def list_existing_shards(shard_dir: str) -> list[str]:
         return []
     return [os.path.join(shard_dir, f) for f in sorted(os.listdir(shard_dir))
             if f.endswith(".jsonl")]
+
+
+def fmt_chars(n: float) -> str:
+    """把字符数格式化成人能读的短串（小规模测试时也不会全显示 0.0M）。"""
+    n = float(n)
+    if n >= 1e9:
+        return f"{n/1e9:.2f}B"
+    if n >= 1e6:
+        return f"{n/1e6:.1f}M"
+    if n >= 1e3:
+        return f"{n/1e3:.1f}k"
+    return f"{n:.0f}"
 
 
 # ---------------------------------------------------------------- 1. 清洗
@@ -116,28 +168,41 @@ def clean_category(raw_dir, cat, ccfg, out_dir, is_doc,
     os.makedirs(shard_dir, exist_ok=True)
 
     existing = list_existing_shards(shard_dir)
+    existing_chars, existing_items = ((shard_stats(existing) if existing else (0, 0)))
+
     if reuse and existing:
-        have = shard_chars(existing)
-        if budget_chars is None or have >= budget_chars:
+        if budget_chars is None or existing_chars >= budget_chars:
             st = CleanStats()
-            st.kept = sum(1 for _ in ())  # 未知，报告里会显示复用
-            print(f"      复用已有 {len(existing)} 个分片 / {have/1e6:.0f}M 字符"
+            st.kept = existing_items
+            print(f"      复用已有 {len(existing)} 个分片 / "
+                  f"{existing_chars/1e6:.0f}M 字符"
                   f"{'（已达预算）' if budget_chars else ''}")
-            return existing, st, have
-        print(f"      已有 {len(existing)} 个分片 / {have/1e6:.0f}M 字符，"
-              f"未达预算 {budget_chars/1e6:.0f}M，继续清洗")
+            return existing, st, existing_chars
+        # 续清洗必须先跳过已经处理过的原始文件，否则会重复清洗 → 数据重复
+        remain, skipped = resume_files(files, existing)
+        if not remain:
+            st = CleanStats()
+            st.kept = existing_items
+            print(f"      原始文件已全部处理完（{len(files)} 个），"
+                  f"保留 {existing_items:,} 条 / {existing_chars/1e6:.0f}M 字符")
+            return existing, st, existing_chars
+        print(f"      已有 {len(existing)} 个分片 / {existing_chars/1e6:.0f}M 字符，"
+              f"未达预算 {budget_chars/1e6:.0f}M；"
+              f"跳过前 {skipped} 个原始文件，从第 {skipped+1}/{len(files)} 个续清洗")
+        files = remain
     else:
         # 全新清洗：清掉旧分片
         for f in os.listdir(shard_dir):
             if f.endswith(".jsonl"):
                 os.remove(os.path.join(shard_dir, f))
         existing = []
+        existing_chars, existing_items = 0, 0
 
     st = CleanStats()
     deduper = Deduper(ccfg.near_dedup_similarity)
     shards: list[str] = list(existing)
     buf: list[Conversation] = []
-    kept_chars: list[int] = [shard_chars(existing) if existing else 0]
+    kept_chars: list[int] = [existing_chars]
     stop = [False]
 
     def flush():
@@ -197,6 +262,13 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Dreamy 流式数据构建")
     p.add_argument("--config", default=os.path.join(ROOT, "configs", "mix.yaml"))
     p.add_argument("--stage", default="pretrain", choices=["pretrain"])
+    p.add_argument("--mix-key", default=None,
+                   help="用 configs/mix.yaml 里的哪个段落（默认同 --stage）。"
+                        "例如 --stage pretrain --mix-key pretrain_v2")
+    p.add_argument("--max-epochs", type=float, default=None,
+                   help="单类数据最多重复几轮（默认取配置里的 max_epochs）")
+    p.add_argument("--plan-only", action="store_true",
+                   help="只清洗 + 打印预算表，不训练 tokenizer、不打包")
     p.add_argument("--raw-dir", default=None)
     p.add_argument("--out-dir", default=os.path.join(ROOT, "data", "processed"))
     p.add_argument("--tokenize", action="store_true")
@@ -213,14 +285,19 @@ def main(argv=None) -> int:
     q = cfg.get("quality", {})
     tk = cfg.get("tokenizer", {})
     stage = args.stage
-    stage_cfg = cfg.get(stage) or {}
+    mix_key = args.mix_key or stage
+    stage_cfg = cfg.get(mix_key) or {}
     if not stage_cfg.get("categories"):
-        print(f"配置里没有 {stage} 段", file=sys.stderr)
+        print(f"配置里没有 {mix_key} 段", file=sys.stderr)
         return 1
 
     weights = normalize_weights(stage_cfg["categories"])
     doc_cats = set(stage_cfg.get("document_categories") or [])
     seq_len = int(stage_cfg.get("packing", {}).get("seq_len", 1024))
+    max_epochs = float(
+        args.max_epochs if args.max_epochs is not None
+        else stage_cfg.get("max_epochs", 1.0)
+    )
     val_ratio = float(q.get("val_ratio", 0.01))
     seed = int(cfg.get("seed", 42))
 
@@ -263,6 +340,20 @@ def main(argv=None) -> int:
             avail_items[cat] = 0
             avail_chars[cat] = 0
             continue
+        if args.plan_only:
+            # 规划模式：完全跳过清洗（那是最慢的一步），只用现成分片估算。
+            # 没洗过的类别（比如 depth）会显示 0，属于正常的保守估计。
+            shards = list_existing_shards(os.path.join(out_dir, "cleaned", cat))
+            have_c, have_i = (shard_stats(shards) if shards else (0, 0))
+            print(f"  {cat}: [plan-only] 跳过清洗，"
+                  f"复用 {len(shards)} 个分片 / {have_c/1e6:.0f}M 字符")
+            shard_map[cat] = shards
+            st = CleanStats()
+            st.kept = have_i
+            stats_by_cat[cat] = st
+            avail_items[cat] = have_i
+            avail_chars[cat] = have_c
+            continue
         ccfg = build_clean_config(q, document=cat in doc_cats,
                                   lenient=cat in LENIENT_CATEGORIES)
         print(f"  {cat}: 清洗中 ...")
@@ -288,13 +379,68 @@ def main(argv=None) -> int:
     print("-" * 78)
     # 预算总量 = 各类可用之和（尽量用满）；某类不足时其他类不会超额
     budget_total = args.max_chars or total_avail_chars
-    budgets = {
-        k: min(budget_total * weights[k], avail_chars.get(k, 0))
-        for k in weights
-    }
+    # 和 v1 的关键区别：预算直接按配比算，**不再 min 到可用量**。
+    # 稀缺类别用「重复训练」补齐，而不是让 general 顶上空缺 ——
+    # v1 就是这么把 general 从 50% 顶到 60% 的，配比全歪了。
+    budgets = {k: float(budget_total) * weights[k] for k in weights}
+    eps = max(1.0, float(budget_total) * 1e-4)
+    capped: dict[str, float] = {}
     for k in weights:
-        print(f"  {k:<10} 可用 {avail_chars.get(k,0)/1e6:>9.1f}M  "
-              f"预算 {budgets[k]/1e6:>9.1f}M")
+        avail = float(avail_chars.get(k, 0))
+        if avail <= 0:
+            capped[k] = 0.0
+            print(f"  [warn] {k:<10} 无可用数据，占比 {weights[k]:.1%} 将分摊给其他类")
+            continue
+        cap = avail * max_epochs
+        if budgets[k] > cap:
+            capped[k] = cap
+            print(f"  [warn] {k:<10} 需 {fmt_chars(budgets[k])} 字符 = "
+                  f"{budgets[k]/avail:.1f} 轮 > 上限 {max_epochs:.1f} 轮，"
+                  f"截断到 {fmt_chars(cap)}")
+        else:
+            capped[k] = budgets[k]
+    shortfall = float(budget_total) - sum(capped.values())
+    if shortfall > eps:
+        # 缺口按「还剩多少产能」分摊，通常全部落到 general 上。
+        # 必须分轮分摊：一轮就可能把接收方也顶到上限，剩下还要继续找下家。
+        for _ in range(10):
+            headroom = {
+                k: max(0.0, float(avail_chars.get(k, 0)) * max_epochs - capped[k])
+                for k in weights
+            }
+            hsum = sum(headroom.values())
+            if shortfall <= eps or hsum <= 0:
+                break
+            for k in weights:
+                give = min(shortfall * headroom[k] / hsum, headroom[k])
+                capped[k] += give
+            new_shortfall = float(budget_total) - sum(capped.values())
+            if new_shortfall >= shortfall - eps:
+                break
+            shortfall = new_shortfall
+        if shortfall > eps:
+            print(f"  [warn] 缺口 {fmt_chars(shortfall)} 字符无处分摊，"
+                  f"总量会低于目标（需要补数据）", file=sys.stderr)
+        else:
+            gained = [f"{k}+{fmt_chars(capped[k] - float(budget_total)*weights[k])}"
+                      for k in weights
+                      if capped[k] > float(budget_total) * weights[k] + eps]
+            print("  缺口已按剩余产能分摊给：" + "、".join(gained))
+    budgets = capped
+
+    for k in weights:
+        avail = float(avail_chars.get(k, 0))
+        ep = budgets[k] / avail if avail else 0.0
+        print(f"  {k:<10} 可用 {fmt_chars(avail):>9}  预算 {fmt_chars(budgets[k]):>9}"
+              f"  重复 {ep:>4.2f} 轮")
+    tot = sum(budgets.values())
+    print(f"  {'合计':<10} 可用 {fmt_chars(total_avail_chars):>9}  "
+          f"预算 {fmt_chars(tot):>9} "
+          f"（≈ {tot*0.617/1e9:.2f}B token）")
+
+    if args.plan_only:
+        print("\n[plan-only] 只做规划，不训练 tokenizer、不打包。")
+        return 0
 
     # ---- 3. tokenizer ----
     tok_path = os.path.join(out_dir, "tokenizer.model")
@@ -367,39 +513,62 @@ def main(argv=None) -> int:
         if len(buf) >= CHUNK:
             flush(target)
 
+    epochs_used: dict[str, float] = {}
     try:
         for cat in weights:
             budget = budgets[cat]
-            acc = 0
-            for sh in shard_map[cat]:
-                if acc >= budget:
-                    break
-                items = list(read_jsonl(sh))   # 一次只读一个分片
-                rng.shuffle(items)
-                for conv in items:
+            shards = shard_map[cat]
+            avail = float(avail_chars.get(cat, 0))
+            if budget <= 0 or not shards:
+                epochs_used[cat] = 0.0
+                continue
+            acc = 0.0
+            ep = 0
+            # 预算可能超过「可用量 × max_epochs」（分摊后偶发），
+            # 所以必须给轮数硬上限，否则会无限循环下去。
+            max_rounds = max(1, int(math.ceil(max_epochs)) + 1)
+            # 不足预算时循环重复整个类别（每轮重新打乱分片顺序），
+            # 直到凑满预算或达到轮数上限。
+            while acc < budget and ep < max_rounds:
+                ep += 1
+                order = list(shards)
+                rng.shuffle(order)
+                gained = 0.0
+                for sh in order:
                     if acc >= budget:
                         break
-                    is_val = (zlib.crc32(conv.text.encode("utf-8")) % 10000
-                              < val_ratio * 10000)
-                    target = "val" if is_val else "train"
+                    items = list(read_jsonl(sh))   # 一次只读一个分片
+                    rng.shuffle(items)
+                    for conv in items:
+                        if acc >= budget:
+                            break
+                        is_val = (zlib.crc32(conv.text.encode("utf-8")) % 10000
+                                  < val_ratio * 10000)
+                        target = "val" if is_val else "train"
 
-                    if conv.is_document:
-                        toks = sp.encode(conv.text, out_type=int)
-                        toks.append(ids_of[END_TOKEN])
-                        n_doc += 1
-                    else:
-                        toks = []
-                        for t in conv.turns:
-                            toks.append(ids_of[ROLE_TO_TOKEN.get(t.role, "<|user|>")])
-                            toks.extend(sp.encode(t.text, out_type=int))
-                        toks.append(ids_of[END_TOKEN])
-                        n_conv += 1
+                        if conv.is_document:
+                            toks = sp.encode(conv.text, out_type=int)
+                            toks.append(ids_of[END_TOKEN])
+                            n_doc += 1
+                        else:
+                            toks = []
+                            for t in conv.turns:
+                                toks.append(ids_of[ROLE_TO_TOKEN.get(t.role, "<|user|>")])
+                                toks.extend(sp.encode(t.text, out_type=int))
+                            toks.append(ids_of[END_TOKEN])
+                            n_conv += 1
 
-                    emit(toks, target)
-                    acc += conv.total_chars
-                    n_chars += conv.total_chars
-                    taken_items[cat] = taken_items.get(cat, 0) + 1
-                    taken_chars[cat] = taken_chars.get(cat, 0) + conv.total_chars
+                        emit(toks, target)
+                        acc += conv.total_chars
+                        gained += conv.total_chars
+                        n_chars += conv.total_chars
+                        taken_items[cat] = taken_items.get(cat, 0) + 1
+                        taken_chars[cat] = taken_chars.get(cat, 0) + conv.total_chars
+                if gained <= 0:
+                    break
+            epochs_used[cat] = acc / avail if avail else 0.0
+            print(f"  {cat:<10} 写入 {acc/1e6:>9.1f}M 字符 / "
+                  f"{ep} 轮（{epochs_used[cat]:.2f} epoch）")
         if cur_target[0] is not None:
             flush(cur_target[0])
     finally:
@@ -421,8 +590,11 @@ def main(argv=None) -> int:
         "special_token_ids": ids_of,
         "stage": stage,
         "seq_len": seq_len,
+        "mix_key": mix_key,
         "mix_target": weights,
         "mix_actual": actual,
+        "max_epochs": max_epochs,
+        "epochs_used": epochs_used,
     }
     write_meta(os.path.join(out_dir, "meta.json"), meta)
 

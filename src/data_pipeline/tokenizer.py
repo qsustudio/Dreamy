@@ -341,7 +341,9 @@ def pack_sft_arrays(
 
         n_supervised += sum(1 for x in lab if x != IGNORE_INDEX)
 
-        nt = np.full(seq_len, pad_id, dtype=np.int32)
+        # tokens 用 uint16（词表 32768 装得下），比 int32 省一半磁盘和传输量。
+        # labels 必须 int32，因为要放 -100 这个哨兵值。
+        nt = np.full(seq_len, pad_id, dtype=np.uint16)
         nl = np.full(seq_len, IGNORE_INDEX, dtype=np.int32)
         nt[:len(ids)] = ids
         nl[:len(lab)] = lab

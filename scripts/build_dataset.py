@@ -60,6 +60,9 @@ from tokenizer import (                                                 # noqa: 
 # 这些类别不按长度规则砍（短但关键，如危机干预话术）
 LENIENT_CATEGORIES = {"safety", "boundary"}
 
+# 这些类别不做去重：身份数据是刻意重复上采样的
+NO_DEDUP_CATEGORIES = {"identity"}
+
 STAGE_DIRS = {"pretrain": "raw", "sft": "raw_sft"}
 
 
@@ -116,7 +119,7 @@ def run_clean(raw_dir: str, out_dir: str, stage_cfg: dict, q: dict,
 
     for cat in categories:
         cleaned_path = os.path.join(out_dir, "cleaned", f"{cat}.jsonl")
-        if reuse and os.path.isfile(cleaned_path):
+        if reuse and os.path.isfile(cleaned_path) and cat not in NO_DEDUP_CATEGORIES:
             kept = list(read_jsonl(cleaned_path))
             pools[cat] = kept
             stats_by_cat[cat] = CleanStats()   # 复用时不重算丢弃统计
@@ -133,6 +136,11 @@ def run_clean(raw_dir: str, out_dir: str, stage_cfg: dict, q: dict,
         is_doc = cat in doc_cats
         ccfg = build_clean_config(q, document=is_doc,
                                   lenient=cat in LENIENT_CATEGORIES)
+        if cat in NO_DEDUP_CATEGORIES:
+            # 身份数据是刻意重复上采样得到的，去重会把上采样全删掉
+            ccfg.exact_dedup = False
+            ccfg.near_dedup = False
+            print(f"  {cat}: 已关闭去重（该类需要重复样本）")
         print(f"  {cat}: {len(files)} 个文件{'（文档类）' if is_doc else ''}")
 
         def raw_iter(files=files, cat=cat, is_doc=is_doc):
