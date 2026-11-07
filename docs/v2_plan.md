@@ -330,6 +330,41 @@ python -u src/train.py --stage sft --out-dir runs_v2 \
 
 ---
 
+## 九、数据补给：今晚不下，明早照旧开训
+
+**2026-11-07 23:40 实测本机网络：**
+
+| 线路 | 实测 | 结论 |
+| --- | --- | --- |
+| huggingface.co 直连 | **完全不通**（连接超时 WinError 10060） | 用不了 |
+| hf-mirror.com | **0.15 MB/s** | 4.98GB 要 9.2 小时 |
+
+候选数据源已经核实并落盘（[docs/v2_data_sources.md](v2_data_sources.md)、
+[scripts/download_v2.py](../scripts/download_v2.py)，core 9 源 4.98GB ≈ 1.0B clean token，
+全部 gated=false 且尺寸经 HF tree API 精确求和）。
+
+**但今晚下不完，也不该等它** —— 即使数据到了，重建 `tokens.bin` 还要 2.5~3.5h，
+赶不上明早开训。所以：
+
+> **明早训练用本地数据（2.22B 可用，已经够训满 2.4B）。新数据下一轮再用。**
+
+省下来的带宽可以先挂两块性价比最高的（后台跑，愿意就挂，不影响清洗）：
+
+```bash
+# 真实中文心理咨询多轮（0.74GB，约 82 分钟）
+# 价值：把 empathy 从「3.4 轮重复 keyword 过滤数据」换成真实咨询对话
+python -u scripts/download_v2.py --only \
+  counseling_cpsdd,counseling_psycheval,counseling_soulchat_r1,counseling_sage
+
+# 真实用户多轮对话（0.73GB，约 81 分钟）
+python -u scripts/download_v2.py --only sharegpt90k_zh
+```
+
+下完不用管。下一轮重建数据集时，按 §4.2b 的方式加进 `mix.yaml` 和 `--clean-only` 即可。
+需要新写的 record adapter 共 5 处，都是机械改动，清单见 `docs/v2_data_sources.md` 末尾。
+
+---
+
 ## 附：关键数字速查
 
 ```
