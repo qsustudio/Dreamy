@@ -84,6 +84,11 @@ MFU = tok/s × 6 × N × f / 209.5e12
 
 > general 的 1.69B 是「全部 12 个原始分片都清洗完」的估计值：
 > 已清洗 6 个分片得到 1.368B 字符，原始→清洗保留率 83%，剩 6 个分片同理。
+>
+> chat 的原始池其实**已经基本挖干了**：清洗出 872 万条对话，而原始是 1883 万行
+> （LCCC 一问一答约占 941 万条 pair），已经是 93% 的转化率。
+> 所以 chat 的缺口不是「没洗完」，而是「raw 里就没有更多」——
+> 想降重复轮数只能换更好的对话数据源，多洗没用。
 
 **关键判断：数据基本够，不需要靠大量重复硬凑。**
 平均重复 1.1 轮，最狠的 empathy 3.4 轮 —— 都远在 4 轮无损线以内
@@ -146,18 +151,51 @@ python -u scripts/build_dataset_streaming.py \
   --stage pretrain \
   --mix-key pretrain_v2 \
   --reuse-shards \
+  --clean-only general,depth \
   --tokenize \
   --max-chars 3890000000
 ```
 
 - `--max-chars 3890000000` = 38.9 亿字符 ≈ **2.40B token**
-- `--reuse-shards` 复用已有 5 类分片，只补洗 general 剩余分片 + depth
+- `--clean-only general,depth`：**必须加**。只补洗 general 剩下的原始分片 + 清洗全新的 depth，
+  其余 4 类直接复用现成分片
 - **不要加 `--retrain-tokenizer`**：词表必须和 v1 一致（32768），重训会导致
-  和既有 SFT 数据/词表不匹配
+  和既有数据/推理脚本不匹配
 - 预计输出 `tokens.bin` ≈ **4.8GB**，`val_tokens.bin` ≈ 48MB
 
+> **为什么必须写 `--clean-only`**：`--reuse-shards` 续清洗要靠「最后写出的分片对应
+> 哪个原始文件」来猜进度。general 的原始目录没变过，猜得准；但 **chat 的原始目录
+> 后来被重新切分过**（清洗时是 4 个大文件，现在是 95 个），文件名对不上会从头重洗一遍，
+> 直接把数据洗成重复的。所以老类别一律不续洗。
+> 本次改动已经加了 `cleaned/<类>/progress.json` 精确记录进度，以后不会再有这个问题。
+
 跑完检查 `data/processed/meta.json`：
-`num_tokens` 应 ≈ 2.4B，`epochs_used` 应全部 ≤ 3.5。
+`num_tokens` 应 ≈ 2.4B，`epochs_used` 应全部 ≤ 3.5，`mix_actual` 应贴近 `mix_target`。
+
+> **时间不够时的降级**：`--max-chars` 是可以往下调的。
+> 3.89e9 → 2.40B token（要补洗 3 个 general 分片，约 2-3h）
+> 3.40e9 → 2.10B token（只要补洗 2 个，省 40min，D/N 降到 16.5，仍健康）
+> 下限别低于 3.25e9（2.0B token），再低 127M 就吃不满了。
+> 真正耗时的是 general 的 MinHash 近重复（约 6ms/篇），不是 tokenize。
+
+### 4.2b 如果今晚真下载了新数据
+
+新数据**不要**直接丢进 `data/raw/chat/`（会触发上面那个续清洗问题）。
+放成新目录，当成新类别：
+
+```bash
+# 1) 新数据放进新目录
+data/raw/chat_new/part-000.jsonl
+
+# 2) configs/mix.yaml 的 pretrain_v2.categories 里加一行，从原类别挪一点权重过来
+#    chat: 0.19  ->  chat: 0.13 / chat_new: 0.06
+
+# 3) 构建时把新类别加进 --clean-only
+python -u scripts/build_dataset_streaming.py --stage pretrain --mix-key pretrain_v2 \
+  --reuse-shards --clean-only general,depth,chat_new --tokenize --max-chars 3890000000
+```
+
+新数据越多，`epochs_used` 里 chat/empathy 的重复轮数越低，效果越好。
 
 ### 4.3 可以顺手清理
 

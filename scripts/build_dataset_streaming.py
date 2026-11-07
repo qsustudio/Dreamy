@@ -118,11 +118,43 @@ def last_consumed_source(shards: list[str]) -> str | None:
     return None
 
 
+def progress_path(shard_dir: str) -> str:
+    return os.path.join(shard_dir, "progress.json")
+
+
+def read_progress(shard_dir: str) -> set[str]:
+    """读「已经清洗过哪些原始文件」的进度清单。
+
+    没有这份清单就必须靠猜（见 resume_files 的注释），而猜错两次的代价
+    是数据重复或者漏数据，所以清洗时一定把它写下来。
+    """
+    path = progress_path(shard_dir)
+    if not os.path.isfile(path):
+        return set()
+    try:
+        with open(path, encoding="utf-8") as f:
+            return set(json.load(f).get("processed_files") or [])
+    except (OSError, json.JSONDecodeError):
+        return set()
+
+
+def write_progress(shard_dir: str, processed: set[str], chars: int) -> None:
+    try:
+        with open(progress_path(shard_dir), "w", encoding="utf-8") as f:
+            json.dump({"processed_files": sorted(processed),
+                       "cleaned_chars": int(chars)}, f, ensure_ascii=False)
+    except OSError:
+        pass          # 进度文件写不了不该让整次清洗失败
+
+
 def resume_files(files: list[str], existing: list[str]) -> tuple[list[str], int]:
     """续清洗时跳过已经写过分片的原始文件。
 
-    整份跳过而不是"从中间接着读"：文件里被打断的位置没有记录，
-    宁可少要一个文件尾巴（几千万字符），也不要引入重复数据。
+    优先用 progress.json 里的精确清单。**没有清单时只能退化成猜**：
+    假设「最后一个分片的 source 就是最后读到的原始文件」，整份跳过。
+    这个假设只在原始文件目录没有重新切分过时成立 —— 重新切分过的话
+    文件名对不上，会从头重洗一遍（数据重复）。所以对老类别请配
+    --clean-only 明确指定要清洗哪些类。
     """
     last = last_consumed_source(existing)
     if last is None:
@@ -169,6 +201,7 @@ def clean_category(raw_dir, cat, ccfg, out_dir, is_doc,
 
     existing = list_existing_shards(shard_dir)
     existing_chars, existing_items = ((shard_stats(existing) if existing else (0, 0)))
+    done_files: set[str] = read_progress(shard_dir)
 
     if reuse and existing:
         if budget_chars is None or existing_chars >= budget_chars:
@@ -179,7 +212,11 @@ def clean_category(raw_dir, cat, ccfg, out_dir, is_doc,
                   f"{'（已达预算）' if budget_chars else ''}")
             return existing, st, existing_chars
         # 续清洗必须先跳过已经处理过的原始文件，否则会重复清洗 → 数据重复
-        remain, skipped = resume_files(files, existing)
+        if done_files:
+            remain = [f for f in files if os.path.basename(f) not in done_files]
+            skipped = len(files) - len(remain)
+        else:
+            remain, skipped = resume_files(files, existing)
         if not remain:
             st = CleanStats()
             st.kept = existing_items
@@ -197,6 +234,7 @@ def clean_category(raw_dir, cat, ccfg, out_dir, is_doc,
                 os.remove(os.path.join(shard_dir, f))
         existing = []
         existing_chars, existing_items = 0, 0
+        done_files = set()
 
     st = CleanStats()
     deduper = Deduper(ccfg.near_dedup_similarity)
@@ -213,6 +251,8 @@ def clean_category(raw_dir, cat, ccfg, out_dir, is_doc,
         dump_jsonl(buf, path)
         shards.append(path)
         buf = []
+        # 每落一个分片就记一次进度：中途 Ctrl-C / 断电也能精确续上
+        write_progress(shard_dir, done_files, kept_chars[0])
 
     def raw_iter():
         for fp in files:
@@ -221,6 +261,7 @@ def clean_category(raw_dir, cat, ccfg, out_dir, is_doc,
                 meta={"category": cat, "source": os.path.basename(fp)},
                 document=is_doc,
             )
+            done_files.add(os.path.basename(fp))
 
     for conv in clean_conversations(raw_iter(), ccfg, deduper, st):
         buf.append(conv)
@@ -236,6 +277,7 @@ def clean_category(raw_dir, cat, ccfg, out_dir, is_doc,
         if st.seen % 2_000_000 == 0 and st.seen:
             print(f"      {st.seen:,} 读入 / {st.kept:,} 保留")
     flush()
+    write_progress(shard_dir, done_files, kept_chars[0])
     return shards, st, kept_chars[0]
 
 
@@ -269,6 +311,10 @@ def main(argv=None) -> int:
                    help="单类数据最多重复几轮（默认取配置里的 max_epochs）")
     p.add_argument("--plan-only", action="store_true",
                    help="只清洗 + 打印预算表，不训练 tokenizer、不打包")
+    p.add_argument("--clean-only", default=None,
+                   help="逗号分隔，只清洗这些类别，其余只复用已有分片。"
+                        "老类别续清洗有重复数据风险时用它把范围钉死，"
+                        "例如 --clean-only general,depth")
     p.add_argument("--raw-dir", default=None)
     p.add_argument("--out-dir", default=os.path.join(ROOT, "data", "processed"))
     p.add_argument("--tokenize", action="store_true")
@@ -340,12 +386,16 @@ def main(argv=None) -> int:
             avail_items[cat] = 0
             avail_chars[cat] = 0
             continue
-        if args.plan_only:
-            # 规划模式：完全跳过清洗（那是最慢的一步），只用现成分片估算。
-            # 没洗过的类别（比如 depth）会显示 0，属于正常的保守估计。
+        clean_only = (set(x.strip() for x in args.clean_only.split(",") if x.strip())
+                      if args.clean_only else None)
+        if args.plan_only or (clean_only is not None and cat not in clean_only):
+            # 只用现成分片，不洗新数据。
+            # 老类别（chat 等）的原始文件目录后来被重新切分过，
+            # 靠文件名猜"洗到哪了"会重复，所以干脆不续洗。
             shards = list_existing_shards(os.path.join(out_dir, "cleaned", cat))
             have_c, have_i = (shard_stats(shards) if shards else (0, 0))
-            print(f"  {cat}: [plan-only] 跳过清洗，"
+            why = "plan-only" if args.plan_only else "不在 --clean-only 里"
+            print(f"  {cat}: [{why}] 跳过清洗，"
                   f"复用 {len(shards)} 个分片 / {have_c/1e6:.0f}M 字符")
             shard_map[cat] = shards
             st = CleanStats()
