@@ -91,9 +91,11 @@ def _from_turn_list(items: list, meta: dict) -> Conversation | None:
             return None
         role = str(role).lower()
         # 常见别名映射
-        if role in ("human", "user", "客户", "用户", "human_user"):
+        if role in ("system", "sys", "系统", "系统提示"):
+            role = "system"
+        elif role in ("human", "user", "客户", "用户", "human_user"):
             role = "user"
-        elif role in ("gpt", "assistant", "bot", "ai", "系统", "助手", "回复"):
+        elif role in ("gpt", "assistant", "bot", "ai", "助手", "回复"):
             role = "assistant"
         else:
             return None

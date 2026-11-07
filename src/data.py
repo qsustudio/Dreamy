@@ -100,3 +100,78 @@ def load_dataset(data_dir: str, seq_len: int, device="cpu") -> TokenStream:
 
     tokens = load_token_bin(path)
     return TokenStream(tokens, seq_len, device=device)
+
+
+# ---------------------------------------------------------------- SFT
+IGNORE_INDEX = -100
+
+
+class SFTStream:
+    """SFT 数据：(tokens[N, L], labels[N, L])，其中 labels 只有 assistant
+    位置是真实 token，其余为 -100。这样 loss 只算助手的回复（spec §4.2）。
+
+    数据由 scripts/build_dataset.py --stage sft 产出。
+    """
+
+    def __init__(self, tokens: "np.ndarray", labels: "np.ndarray", device="cpu"):
+        import torch
+
+        if tokens.shape != labels.shape:
+            raise ValueError(
+                f"tokens {tokens.shape} 与 labels {labels.shape} 形状不一致"
+            )
+        self.tokens = torch.from_numpy(tokens).long()   # (N, L)
+        self.labels = torch.from_numpy(labels).long()   # (N, L)，-100 = 不计算
+        self.device = device
+        self.seq_len = int(tokens.shape[1])
+
+    def __len__(self) -> int:
+        return int(self.tokens.shape[0])
+
+    def get_batch(self, batch_size: int, generator=None):
+        """随机取一个 batch，返回 (x, y)。
+
+        x = tokens[:, :-1]，y = labels[:, 1:]（左移一位做下一 token 预测）。
+        """
+        import torch
+
+        n = len(self)
+        if n == 0:
+            raise ValueError("SFT 数据为空")
+        idx = torch.randint(0, n, (min(batch_size, n),), generator=generator)
+        x = self.tokens[idx, :-1]
+        y = self.labels[idx, 1:]
+        return x.to(self.device), y.to(self.device)
+
+    def iter_epoch(self, batch_size: int, generator=None, shuffle: bool = True):
+        """按 epoch 顺序遍历（SFT 需要走完所有样本）。"""
+        import torch
+
+        n = len(self)
+        order = torch.randperm(n, generator=generator) if shuffle else torch.arange(n)
+        for start in range(0, n, batch_size):
+            idx = order[start:start + batch_size]
+            yield (self.tokens[idx, :-1].to(self.device),
+                   self.labels[idx, 1:].to(self.device))
+
+
+def load_sft_dataset(data_dir: str, device="cpu", split: str = "train") -> SFTStream:
+    """加载 SFT 数据。split='train' 或 'val'。"""
+    prefix = "sft" if split == "train" else "sft_val"
+    tpath = os.path.join(data_dir, f"{prefix}_tokens.npy")
+    lpath = os.path.join(data_dir, f"{prefix}_labels.npy")
+    if not (os.path.isfile(tpath) and os.path.isfile(lpath)):
+        raise FileNotFoundError(
+            f"找不到 SFT 数据: {tpath}\n"
+            f"请先运行:\n"
+            f"  python scripts/build_dataset.py --stage sft --tokenize"
+        )
+    return SFTStream(np.load(tpath), np.load(lpath), device=device)
+
+
+def load_val_dataset(data_dir: str, seq_len: int, device="cpu") -> TokenStream | None:
+    """加载预训练验证集（按整条对话切分，不参与训练）。"""
+    p = os.path.join(data_dir, "val_tokens.bin")
+    if not os.path.isfile(p):
+        return None
+    return TokenStream(load_token_bin(p), seq_len, device=device)

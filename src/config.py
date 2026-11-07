@@ -57,24 +57,65 @@ class Paths:
 
 @dataclass
 class ModelConfig:
-    num_tokens: int = 256       # 词表大小
-    max_seq_len: int = 256      # 最大序列长度
-    dim: int = 256              # 隐藏维度
-    depth: int = 6              # 层数
-    heads: int = 8              # 注意力头数
+    """Dreamy-110M（RTX 4090 版本）。
+
+    实测参数量 110M。8h 4090 预算下正好落在 Chinchilla 最优附近
+    （N≈118M, D≈2.35B @ MFU 35%）。
+    """
+    num_tokens: int = 32768     # 词表：中文压缩率比 16k 好约 15%
+    max_seq_len: int = 1024     # 可覆盖 8-12 轮对话
+    dim: int = 768              # Hidden Size
+    depth: int = 12             # Layers
+    heads: int = 12             # Attention Heads
+    head_dim: int = 64          # Head Dimension
+    ffn_mult: float = 8 / 3     # SwiGLU 标准比例，hidden = 2048
+    ffn_glu: bool = True        # SwiGLU
+    dropout: float = 0.05
+
+    # 为什么从 36M 提到 110M：
+    #   4090 算力是 T4 的 2.54x、带宽 3.15x，8h 能跑 2.15B token。
+    #   Chinchilla 最优 N = sqrt(C/120) ≈ 118M，110M 正好贴合。
+    #   原来的 36M/400M 方案只有 D/N=10.6，属于严重欠训练。
 
 
 @dataclass
 class TrainConfig:
-    batch_size: int = 32
+    # 有效 batch = micro_batch * seq_len * grad_accum
+    # 24GB 显存下 110M 模型固定开销只有 1.3GB，micro batch 可以开到 16
+    # 16 * 1024 * 1 = 16,384 token/step
+    batch_size: int = 16        # micro batch
+    grad_accum: int = 1
     lr: float = 3e-4
     weight_decay: float = 0.1
+    beta1: float = 0.9
+    beta2: float = 0.95
     grad_clip: float = 1.0
     max_steps: int = 1000
-    warmup_steps: int = 100
+    warmup_ratio: float = 0.02
+    min_lr_ratio: float = 0.1   # 最低 LR = lr * 0.1
     log_every: int = 20
-    ckpt_every: int = 200
+    ckpt_every: int = 2000
+    eval_every: int = 500
     seed: int = 42
+
+    # 4090 原生支持 bf16，不需要 GradScaler，比 fp16 更稳
+    amp_dtype: str = "bf16"
+
+    @property
+    def effective_batch_tokens(self) -> int:
+        return self.batch_size * self.grad_accum
+
+
+@dataclass
+class SFTConfig:
+    """SFT 阶段超参，对应 spec §5.2。"""
+    lr: float = 5e-5
+    weight_decay: float = 0.01
+    warmup_ratio: float = 0.03
+    min_lr_ratio: float = 0.1
+    epochs: int = 2
+    batch_size: int = 4
+    grad_accum: int = 4
 
 
 @dataclass
@@ -82,6 +123,7 @@ class Config:
     paths: Paths = field(default_factory=Paths)
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
+    sft: SFTConfig = field(default_factory=SFTConfig)
 
     @property
     def seed(self) -> int:

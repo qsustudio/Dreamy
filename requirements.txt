@@ -32,6 +32,11 @@ lion-pytorch
 pyyaml
 # 中文 tokenizer：从零训练必须先训练词表
 sentencepiece
+# 读 parquet 格式的公开语料
+pyarrow
+# 从 HuggingFace 下载数据集
+huggingface_hub
+hf_transfer
 
 # ---- 开发/测试 ----
 pytest

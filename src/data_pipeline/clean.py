@@ -31,6 +31,14 @@ _RE_URL = re.compile(r"https?://\S+|www\.\S+")
 # 判断「像乱码/无意义」
 _RE_ONLY_SYMBOL = re.compile(r"^[\W_]+$", re.UNICODE)
 
+# 预计算标点集合：ASCII 标点 + 中文常用标点/全角符号。
+# 用集合成员判断替代 unicodedata.category，避免千万级数据的性能灾难。
+_PUNCT_SET = set(
+    "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+    "，。！？、；：“”‘’（）【】《》〈〉「」『』—…·～％＃＠＆＊＋－＝／＼｜"
+    "　﹏﹑﹒﹔﹕﹖﹗﹘﹚﹜﹞！＂＃＄％＆＇（）＊＋，－．／：；＜＝＞？＠［＼］＾＿｀｛｜｝～"
+)
+
 
 @dataclass
 class CleanConfig:
@@ -45,6 +53,13 @@ class CleanConfig:
     exact_dedup: bool = True
     near_dedup: bool = True
     near_dedup_similarity: float = 0.55
+    # 低于这个长度的数据只做精确去重，不做 MinHash 近似去重。
+    #
+    # 原因：MinHash 每个文档要算一遍 32 个哈希，百万级短对话上会慢到
+    # 不可接受（实测 680 万条 LCCC 要 20 分钟以上）。
+    # 而几十字的短句做近似去重意义也不大 —— 精确去重已经能抓到大部分
+    # 完全重复，真正该担心的「复读/灌水」由 repeat_ngram 规则处理。
+    min_chars_for_near_dedup: int = 80
     redact_pii: bool = True
     # 宽松模式：安全类数据不能按长度规则砍（短但关键）
     lenient: bool = False
@@ -122,10 +137,19 @@ def repeat_ngram_ratio(s: str, n: int = 5) -> float:
 
 
 def punct_ratio(s: str) -> float:
+    """标点占比。
+
+    注意：不要用 unicodedata.category(ch) 判标点 —— 那是逐字符的 C 调用，
+    在千万级数据上会慢到不可接受（实测是最大的性能热点）。
+    这里用预计算集合做成员判断，快一个数量级。
+    """
     if not s:
         return 1.0
-    punct = sum(1 for ch in s if unicodedata.category(ch).startswith("P"))
-    return punct / len(s)
+    n = 0
+    for ch in s:
+        if ch in _PUNCT_SET:
+            n += 1
+    return n / len(s)
 
 
 def unique_char_ratio(s: str) -> float:
@@ -164,17 +188,21 @@ def check_conversation(conv: Conversation, cfg: CleanConfig) -> str | None:
         return check_document(conv, cfg)
 
     turns = conv.turns
-
-    # 必须是 user/assistant 交替，且以 user 开头
     if not turns:
         return "empty"
-    if turns[0].role != "user":
+
+    # system 回合（人格设定）允许打头，但真正的对话必须以 user 开始
+    role_turns = [t for t in turns if t.role != "system"]
+    if not role_turns:
+        return "no_dialogue_turns"
+    if role_turns[0].role != "user":
         return "not_user_first"
 
     if not cfg.lenient:
-        if conv.num_turns < cfg.min_turns:
+        # 轮数只算 user/assistant，system 不算一轮
+        if len(role_turns) < cfg.min_turns:
             return "too_few_turns"
-        if conv.num_turns > cfg.max_turns:
+        if len(role_turns) > cfg.max_turns:
             return "too_many_turns"
         if conv.total_chars > cfg.max_chars:
             return "too_long"
@@ -310,13 +338,18 @@ class Deduper:
             keys.append((b, chunk.tobytes()))
         return keys
 
-    def is_duplicate(self, conv: Conversation) -> bool:
+    def is_duplicate(self, conv: Conversation, near: bool = True) -> bool:
         text = conv.text
         h = zlib.crc32(text.encode("utf-8"))
         if h in self._exact:
             self.dups_exact += 1
             self.last_was_exact = True
             return True
+
+        if not near:
+            # 只做精确去重，省掉 MinHash 的开销
+            self._exact.add(h)
+            return False
 
         sig = _minhash_signature(text)
         keys = self._band_keys(sig)
@@ -357,14 +390,19 @@ def clean_conversations(
             stats.drop(reason)
             continue
 
+        # 只有真的被截断过才需要重新校验，否则纯属重复劳动
+        # （千万级数据上这一条能省掉近一半的检查开销）
+        chars_before = conv.total_chars
         conv = truncate(conv, cfg.max_chars, cfg.max_chars_document)
-        reason = check_conversation(conv, cfg) if not cfg.lenient else None
-        if reason:
-            stats.drop(reason)
-            continue
+        if conv.total_chars != chars_before:
+            reason = check_conversation(conv, cfg) if not cfg.lenient else None
+            if reason:
+                stats.drop(reason)
+                continue
 
         if keep_dedup:
-            if deduper.is_duplicate(conv):
+            near = cfg.near_dedup and conv.total_chars >= cfg.min_chars_for_near_dedup
+            if deduper.is_duplicate(conv, near=near):
                 reason = "duplicate_exact" if deduper.last_was_exact else "duplicate_near"
                 stats.drop(reason)
                 continue

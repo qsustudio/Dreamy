@@ -55,29 +55,34 @@ def format_report(
 
     # ---------------- 1. 配比 ----------------
     add("")
-    add("[1] 数据配比（目标 vs 实际）")
+    add("[1] 数据配比（目标 vs 实际，按 token/字符统计）")
     add("-" * W)
-    add(f"{'类别':<12}{'目标':>8}{'实际':>8}{'偏差':>9}{'可用':>10}{'取用':>10}")
+    add(f"{'类别':<12}{'目标':>8}{'实际':>8}{'偏差':>9}"
+        f"{'可用字符':>12}{'取用字符':>12}")
     for k in mix.target:
         tgt = mix.target[k]
         act = mix.actual.get(k, 0.0)
         dev = act - tgt
         flag = "  <-- 偏离大" if abs(dev) > 0.05 else ""
+        ac = mix.available_chars.get(k, 0) if hasattr(mix, "available_chars") else 0
+        tc = mix.taken_chars.get(k, 0) if hasattr(mix, "taken_chars") else 0
         add(
             f"{k:<12}{tgt:>7.1%}{act:>8.1%}{dev:>+9.1%}"
-            f"{mix.available.get(k, 0):>10,}{mix.taken.get(k, 0):>10,}{flag}"
+            f"{ac/1e6:>10.1f}M{tc/1e6:>11.1f}M{flag}"
         )
     add("-" * W)
+    tot_chars = mix.total_chars if hasattr(mix, "total_chars") else 0
     add(f"{'合计':<12}{'':>8}{'':>8}{'':>9}"
-        f"{sum(mix.available.values()):>10,}{mix.total:>10,}")
+        f"{sum(mix.available_chars.values())/1e6:>10.1f}M"
+        f"{tot_chars/1e6:>11.1f}M")
 
     # ---------------- 2. 清洗情况 ----------------
     add("")
     add("[2] 清洗情况（各类丢弃原因）")
     add("-" * W)
     for cat, st in stats_by_cat.items():
-        if st.seen == 0:
-            add(f"  {cat}: 未提供数据")
+        if st.seen == 0 and st.kept == 0:
+            add(f"  {cat}: 未重新清洗（复用 cleaned 数据）")
             continue
         keep_rate = st.kept / st.seen if st.seen else 0
         add(f"  {cat}: 读入 {st.seen:,} -> 保留 {st.kept:,} "
@@ -138,7 +143,8 @@ def format_report(
             warnings.append(f"{k} 类没有数据（目标 {mix.target[k]:.1%}）")
 
     # 通用语料占比过低是从零训练最容易崩的原因
-    if mix.actual.get("general", 0.0) < 0.35:
+    # （SFT 阶段没有 general 类别，不适用这条检查）
+    if "general" in mix.target and mix.actual.get("general", 0.0) < 0.35:
         warnings.append(
             f"general（通用语料）实际仅 {mix.actual.get('general',0):.1%}。"
             f"从零训练时这一项低于 35% 极易导致语言能力不稳定/训练发散。"

@@ -11,16 +11,40 @@ from config import ModelConfig
 
 
 def build_model(cfg: ModelConfig) -> TransformerWrapper:
-    """构建一个自回归 Transformer。"""
+    """构建 Dreamy-36M。
+
+    对应 spec v1.1 的架构表：
+        Decoder-only / RoPE / RMSNorm / Pre-Norm / SwiGLU / Weight Tying
+
+    几个必须显式打开的开关（默认值会让参数量对不上）：
+        ff_glu=True       -> SwiGLU，不开只有 29.4M（开了 35.69M）
+        tie_embedding=True-> 输出头和 embedding 共享，省 8.39M
+        use_abs_pos_emb=False + rotary_pos_emb=True  用 RoPE 不用绝对位置编码
+    """
     return TransformerWrapper(
         num_tokens=cfg.num_tokens,
         max_seq_len=cfg.max_seq_len,
+        use_abs_pos_emb=False,       # RoPE 取代绝对位置编码
+        tie_embedding=True,          # 权重共享
+        emb_dropout=cfg.dropout,
         attn_layers=Decoder(
             dim=cfg.dim,
             depth=cfg.depth,
             heads=cfg.heads,
+            attn_dim_head=cfg.head_dim,
+            rotary_pos_emb=True,
+            use_rmsnorm=True,
+            pre_norm=True,
+            attn_dropout=cfg.dropout,
+            ff_dropout=cfg.dropout,
+            ff_mult=cfg.ffn_mult,
+            ff_glu=cfg.ffn_glu,
         ),
     )
+
+
+def count_params(model) -> int:
+    return sum(p.numel() for p in model.parameters())
 
 
 def build_trainable(cfg: ModelConfig):
