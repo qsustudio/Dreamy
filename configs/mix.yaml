@@ -31,13 +31,15 @@ pretrain:
   # 注意：之前 spec 里的 narrative（故事叙事）在 HF 上没找到干净的公开源，
   # 暂时并入 general。如果以后找到（如中文小说语料），在这里加回来。
   categories:
-    general: 0.38      # 通用中文网页（已质量过滤）
-    chat: 0.22         # 闲聊对话
-    knowledge: 0.18    # 百科/知识
-    empathy: 0.08      # 情绪交流
-    depth: 0.07        # 深度讨论
+    general: 0.50      # 通用中文网页（已质量过滤）
+    chat: 0.17         # 闲聊对话（LCCC 最浅，占比压低）
+    knowledge: 0.22    # 百科/知识
+    empathy: 0.07      # 情绪交流
     safety: 0.04       # 安全边界
-    persona: 0.03      # 人格一致
+    # depth / persona 暂时不进预训练：
+    #   长文档 MinHash 太慢（6ms/篇），且这两类在 SFT 阶段
+    #   用小规模高质量数据塑形效率高得多。
+    #   需要时把权重加回来即可（默认会从 1.0 归一化）。
 
   packing:
     seq_len: 1024      # 与 ModelConfig.max_seq_len 一致

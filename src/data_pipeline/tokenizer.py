@@ -175,69 +175,90 @@ def pack_tokens(
         if tid == sp.unk_id():
             raise ValueError(f"特殊 token {name} 不在词表里，tokenizer 训练可能失败了")
 
-    ids: list[int] = []
-    labels: list[int] = [] if labels_path else None
+    # 分批写入，绝不把上亿 token 全塞进一个 Python list。
+    # 5 亿个 int 在 Python 里约 14GB，2B token 直接 OOM。
+    CHUNK = 2_000_000
+    buf: list[int] = []
+    lab_buf: list[int] = []
+    total_written = 0
+    n_supervised = 0
     n_conv = 0
     n_doc = 0
     n_chars = 0
-    n_supervised = 0
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fout = open(out_path, "wb")
+    flabel = open(labels_path, "wb") if labels_path else None
+
+    def flush() -> None:
+        nonlocal buf, lab_buf, total_written
+        if not buf:
+            return
+        np.asarray(buf, dtype=np.uint16).tofile(fout)
+        if flabel is not None:
+            np.asarray(lab_buf, dtype=np.int32).tofile(flabel)
+        total_written += len(buf)
+        buf = []
+        lab_buf = []
 
     def emit(token_id: int, supervised: bool) -> None:
         nonlocal n_supervised
-        ids.append(token_id)
-        if labels is not None:
+        buf.append(token_id)
+        if labels_path is not None:
             if supervised or not assistant_only:
-                labels.append(token_id)
+                lab_buf.append(token_id)
                 n_supervised += 1
             else:
-                labels.append(IGNORE_INDEX)
+                lab_buf.append(IGNORE_INDEX)
+        if len(buf) >= CHUNK:
+            flush()
 
-    for conv in convs:
-        if conv.is_document:
-            for tok in sp.encode(conv.text, out_type=int):
-                emit(tok, supervised=not assistant_only)
-            emit(ids_of[END_TOKEN], supervised=not assistant_only)
-            n_doc += 1
-            n_chars += conv.total_chars
-            continue
+    try:
+        for conv in convs:
+            if conv.is_document:
+                body = sp.encode(conv.text, out_type=int)
+                buf.extend(body)
+                if labels_path is not None:
+                    lab_buf.extend([IGNORE_INDEX] * len(body))
+                emit(ids_of[END_TOKEN], supervised=not assistant_only)
+                n_doc += 1
+                n_chars += conv.total_chars
+                if len(buf) >= CHUNK:
+                    flush()
+                continue
 
-        for t in conv.turns:
-            tag = ROLE_TO_TOKEN.get(t.role, USER_TOKEN)
-            # 角色标记本身不计 loss（模型不需要学着生成 <|user|>）
-            emit(ids_of[tag], supervised=False)
-            is_assistant = (t.role == "assistant")
-            for tok in sp.encode(t.text, out_type=int):
-                emit(tok, supervised=is_assistant)
-            n_chars += len(t.text)
+            for t in conv.turns:
+                tag = ROLE_TO_TOKEN.get(t.role, USER_TOKEN)
+                # 角色标记本身不计 loss（模型不需要学着生成 <|user|>）
+                emit(ids_of[tag], supervised=False)
+                is_assistant = (t.role == "assistant")
+                for tok in sp.encode(t.text, out_type=int):
+                    emit(tok, supervised=is_assistant)
+                n_chars += len(t.text)
 
-        # 结束标记：如果最后是 assistant 说的，就让它学着收尾
-        last_is_asst = bool(conv.turns) and conv.turns[-1].role == "assistant"
-        emit(ids_of[END_TOKEN], supervised=last_is_asst)
-        n_conv += 1
-
-    arr = np.asarray(ids, dtype=np.uint16)
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    arr.tofile(out_path)
+            # 结束标记：如果最后是 assistant 说的，就让它学着收尾
+            last_is_asst = bool(conv.turns) and conv.turns[-1].role == "assistant"
+            emit(ids_of[END_TOKEN], supervised=last_is_asst)
+            n_conv += 1
+        flush()
+    finally:
+        fout.close()
+        if flabel is not None:
+            flabel.close()
 
     meta = {
         "vocab_size": vocab_size,
-        "num_tokens": int(arr.size),
+        "num_tokens": total_written,
         "num_conversations": n_conv,
         "num_documents": n_doc,
         "num_chars": n_chars,
-        "tokens_per_char": (arr.size / n_chars) if n_chars else 0.0,
+        "tokens_per_char": (total_written / n_chars) if n_chars else 0.0,
         "special_token_ids": ids_of,
     }
 
-    if labels is not None:
-        lab = np.asarray(labels, dtype=np.int32)
-        if lab.size != arr.size:
-            raise RuntimeError(
-                f"labels 长度 {lab.size} 与 tokens 长度 {arr.size} 不一致"
-            )
-        lab.tofile(labels_path)
+    if labels_path is not None:
         meta["num_supervised_tokens"] = int(n_supervised)
-        meta["supervised_ratio"] = n_supervised / arr.size if arr.size else 0.0
+        meta["supervised_ratio"] = (n_supervised / total_written) if total_written else 0.0
 
     return meta
 
