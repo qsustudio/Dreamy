@@ -46,50 +46,60 @@ pretrain:
 
 
 # ---------------- 第二阶段：预训练 v2（5090 32G / 10h）----------------
-# 目标规模：约 2.4B token / 145M 参数（D/N ≈ 16.5）
+# 目标规模：约 2.4B token / 127M 参数（D/N ≈ 18.9）
+#
+# 【2026-11-08 更新】已把新下载的 4.98GB 数据接进来（data/raw_src2），
+# 各类可用量大幅增加，最终变成 *11 个类别*：
+#
+#   类别            来源                              清洗后可用   本配比预算  重复
+#   general         opencsg/chinese-fineweb-edu        ~1.69B      1.09B     0.65x
+#   chat            silver/lccc (浅对话)                ~0.22B      0.288B    1.30x
+#   chat_v2         shareAI/ShareGPT-Chinese-90k        ~0.08B      0.120B    1.43x
+#   knowledge       wanng/wikipedia-zh-mnbvc           ~0.16B      0.096B    0.62x
+#   knowledge_v2    wikimedia/wikipedia 20231101.zh    ~0.54B      0.312B    0.58x
+#   depth           Mxode/Chinese-Instruct 深度分流       ~0.10B      0.072B    0.73x
+#   depth_v2        wangrui6/Zhihu-KOL                  ~0.39B      0.240B    0.62x
+#   empathy         Mxode/Chinese-Instruct 情绪分流       ~0.04B      0.048B    1.14x
+#   empathy_v2      XuShihao6715/counseling-* x4        ~0.07B      0.096B    1.43x
+#   safety          Mxode/Chinese-Instruct 安全分流       ~0.01B      0.014B    1.31x
+#   safety_v2       Skepsun/cvalues_rlhf                 ~0.01B      0.022B    1.80x
+#   --------------------------------------------------------------
+#   合计                                                ~3.42B      2.40B    0.70x
+#
+# 也就是说：**这一轮几乎每个类别都只训一遍**，不再靠重复硬凑。
+# 聚合占比：general 45.5% / chat 17% / knowledge 17% / depth 13% /
+#           empathy 6% / safety 1.5%
 #
 # 和 v1 配比的三点区别，都是踩过坑之后改的：
 #
 #  1. 把 depth 加回来（v1 权重建为 0，等于白扔 15 万条深度讨论数据）
 #
-#  2. general 从 0.50 降到 0.52→0.53 看起来差不多，但 v1 实际跑出来是
-#     0.60 —— 原因是 chat/knowledge/empathy/safety 全部提前耗尽，
-#     general 被迫顶上空缺。结果模型语言分布更偏"网页文章"，
-#     对话感被稀释。v2 改成「稀缺类超采样」，不再让 general 兜底。
+#  2. general 不再兜底。v1 配比写 0.50，实际跑出来 0.60 —— 因为
+#     chat/knowledge/empathy/safety 全部提前耗尽，general 被迫顶上空缺。
+#     v2 改成「稀缺类超采样」，缺口不再甩给 general。
 #
 #  3. 允许 max_epochs：某类不够时循环重复，而不是降低占比。
-#     重复 4 遍以内近似无损（Muennighoff et al. 2023），
-#     超过就该补数据了 —— 所以这里是 4.0 的硬上限。
-#
-# 预算是这么反推出来的（数字来自 scripts/report_pools.py 实测）：
-#
-#     类别        本地可清洗出的 token      v1 已用      备注
-#     general            1.69B              0.64B      还有 6 个未清洗的原始分片
-#     chat               0.22B              0.22B      已耗尽（LCCC，短浅）
-#     knowledge          0.16B              0.16B      已耗尽
-#     depth              0.10B              0           v2 新加进来
-#     empathy            0.04B              0.04B      已耗尽
-#     safety             0.011B             0.011B     已耗尽
-#     ------------------------------------------------------------
-#     合计               2.22B
-#
-# 训练时长固定 10h，145M 模型大约只能吃掉 2.2-2.4B token，
-# 所以目标定 2.4B：general 0.525 × 2.4B ≈ 1.26B，正好用掉 general 的 75%，
-# 剩下 0.75× 的富余留给以后。稀缺类别按 1.7-3.4 轮重复 —— 4 轮以内无损。
+#     4 轮以内近似无损（Muennighoff et al. 2023），超过就该补数据了。
 pretrain_v2:
   document_categories:
     - general
     - knowledge
+    - knowledge_v2      # 维基是整篇文档，不是对话
 
   total: null
 
   categories:
-    general: 0.525     # 通用中文网页（唯一有富余的类，一遍用尽）
-    chat: 0.19         # 闲聊对话（LCCC 偏短偏浅，占比不能再高）
-    knowledge: 0.14    # 百科/知识
-    depth: 0.07        # 深度讨论 / 反思（v2 新增）
-    empathy: 0.06      # 情绪交流
-    safety: 0.015      # 安全边界（总量小，靠重复补齐）
+    general: 0.455     # 通用中文网页：语言 + 世界知识地基
+    chat: 0.12         # LCCC 闲聊（短浅，只能靠量）
+    chat_v2: 0.05      # ShareGPT 中文：真实用户多轮提问
+    knowledge: 0.04    # 旧维基（已耗尽）
+    knowledge_v2: 0.13 # 官方维基 20231101
+    depth: 0.03        # 旧深度讨论
+    depth_v2: 0.10     # 知乎高赞长回答
+    empathy: 0.02      # 旧情绪数据（keyword 分流）
+    empathy_v2: 0.04   # 真实心理咨询多轮 —— 陪伴能力的核心
+    safety: 0.006      # 旧安全数据
+    safety_v2: 0.009   # CValues 安全偏好正例
 
   # 单类最多重复几轮。超过上限时不再硬凑，缺口按剩余产能分摊。
   max_epochs: 4.0

@@ -70,17 +70,29 @@ MFU = tok/s × 6 × N × f / 209.5e12
 
 ## 三、数据配比（实测池子 + 重复轮数）
 
-### 3.1 本地实测可用量（`scripts/report_pools.py` 全量扫描）
+### 3.1 最终数据配比（11 类，已含新下载的 4.98GB）
 
-| 类别 | 来源 | 可清洗出 | v1 已用 | v2 预算(2.4B×占比) | 重复轮数 |
-| --- | --- | --- | --- | --- | --- |
-| general | opencsg/chinese-fineweb-edu (Skypile) | **1.69B** | 0.64B | 1.26B | 0.75× |
-| chat | silver/lccc | 0.222B | 0.222B | 0.456B | 2.05× |
-| knowledge | wanng/wikipedia-zh-mnbvc | 0.156B | 0.156B | 0.336B | 2.15× |
-| depth | Mxode/Chinese-Instruct 关键词分流 | 0.099B | 0（v1 权重为 0） | 0.168B | 1.70× |
-| empathy | 同上 | 0.042B | 0.042B | 0.144B | 3.43× |
-| safety | 同上 | 0.011B | 0.011B | 0.036B | 3.27× |
-| **合计** | | **2.22B** | 1.07B | **2.40B** | 平均 1.1× |
+| 类别 | 来源 | 清洗后可用 | 本配比预算 | 重复轮数 |
+| --- | --- | --- | --- | --- |
+| general | opencsg/chinese-fineweb-edu | **1.69B** | 1.09B | 0.65× |
+| chat | silver/lccc（短浅闲聊） | 0.222B | 0.288B | 1.30× |
+| **chat_v2** | shareAI/ShareGPT-Chinese-90k | 0.084B | 0.120B | 1.43× |
+| knowledge | wanng/wikipedia-zh-mnbvc | 0.156B | 0.096B | 0.62× |
+| **knowledge_v2** | wikimedia/wikipedia 20231101.zh | 0.54B | 0.312B | 0.58× |
+| depth | Mxode/Chinese-Instruct 深度分流 | 0.099B | 0.072B | 0.73× |
+| **depth_v2** | wangrui6/Zhihu-KOL | 0.39B | 0.240B | 0.62× |
+| empathy | Mxode/Chinese-Instruct 情绪分流 | 0.042B | 0.048B | 1.14× |
+| **empathy_v2** | XuShihao6715/counseling-* ×4 | 0.067B | 0.096B | 1.43× |
+| safety | Mxode/Chinese-Instruct 安全分流 | 0.011B | 0.014B | 1.31× |
+| **safety_v2** | Skepsun/cvalues_rlhf | 0.012B | 0.022B | 1.80× |
+| **合计** | | **3.42B** | **2.40B** | **0.70×** |
+
+聚合占比：**general 45.5% / chat 17% / knowledge 17% / depth 13% / empathy 6% / safety 1.5%**
+
+> **这一轮几乎每个类别都只训一遍**（0.58~1.8 轮），不再靠重复硬凑。
+> 上半部分是原有数据，标 **粗体** 的是 2026-11-08 凌晨新下载并接入的 4.98GB。
+
+**关键判断：数据不但够，还有富余。** 可用 3.42B，目标 2.40B，用不完的部分留给下一轮。
 
 > general 的 1.69B 是「全部 12 个原始分片都清洗完」的估计值：
 > 已清洗 6 个分片得到 1.368B 字符，原始→清洗保留率 83%，剩 6 个分片同理。
@@ -96,23 +108,29 @@ MFU = tok/s × 6 × N × f / 209.5e12
 
 ### 3.2 配比本身（`configs/mix.yaml` → `pretrain_v2`）
 
-```
-general   0.525   # 语言 + 世界知识的地基，唯一有富余的类
-chat      0.19    # 对话形态（LCCC 短浅，占比不能再高）
-knowledge 0.14    # 百科/事实，抑制胡说
-depth     0.07    # 深度讨论/反思 —— v2 新增，对应"有深度"
-empathy   0.06    # 情绪交流 —— 陪伴的差异化能力
-safety    0.015   # 安全边界
-max_epochs 4.0    # 单类重复硬上限，超了就报错要求补数据
+```yaml
+general:      0.455   # 语言 + 世界知识地基
+chat:         0.12    # LCCC 闲聊（短浅，靠量）
+chat_v2:      0.05    # ShareGPT 中文：真实用户多轮
+knowledge:    0.04    # 旧维基（已耗尽）
+knowledge_v2: 0.13    # 官方维基 20231101
+depth:        0.03    # 旧深度讨论
+depth_v2:     0.10    # 知乎高赞长回答
+empathy:      0.02    # 旧情绪数据（keyword 分流）
+empathy_v2:   0.04    # 真实心理咨询多轮 —— 陪伴能力的核心
+safety:       0.006   # 旧安全数据
+safety_v2:    0.009   # CValues 安全偏好正例
+max_epochs:   4.0     # 单类重复硬上限，超了就报警要求补数据
 ```
 
-**和 v1 的差别：**
-1. **depth 加回来**（v1 权重是 0，等于把 15 万条深度讨论数据白扔了）
-2. **general 不再兜底**。v1 配比写 0.50，实际跑出来 0.60 —— 因为 chat/knowledge/empathy/safety
-   全部提前耗尽，general 被迫填坑，结果模型更像"网页文章"。
-   v2 改成**稀缺类超采样**，缺口不再甩给 general。
-3. 安全类占比降低，因为它的数据量最小（0.011B），却要靠重复 3.3 轮才够；
-   这一类的塑形主要交给 SFT 阶段。
+**设计依据：**
+1. **general 45.5%** 是语言能力的底座，不能低。v1 实际跑到 60% 是因为别的类
+   提前耗尽、general 被迫兜底 —— 这次改成稀缺类超采样，缺口不再甩给 general。
+2. **chat 17% + knowledge 17% + depth 13%** 是"对话为主 + 有深度"的三根支柱。
+3. **empathy 6%** 单独拎出来，因为陪伴是差异化能力；而且这次终于有了**真实咨询对话**
+   （不再是从 instruct 里按关键词捞出来的）。
+4. **depth 加回来**（v1 权重是 0，等于把 15 万条深度讨论数据白扔了）。
+5. 旧数据源（无 `_v2` 后缀）保留但占比压低，让位给质量更高的新数据。
 
 ### 3.3 代码已支持（本次改动）
 
@@ -144,24 +162,25 @@ max_epochs 4.0    # 单类重复硬上限，超了就报错要求补数据
 python scripts/report_pools.py --include-raw
 ```
 
-### 4.2 正式构建（今晚跑，明早直接用）
+### 4.2 正式构建（已启动，跑 ~2h）
 
 ```bash
 python -u scripts/build_dataset_streaming.py \
   --stage pretrain \
   --mix-key pretrain_v2 \
   --reuse-shards \
-  --clean-only general,depth \
+  --clean-only general,depth,chat_v2,empathy_v2,depth_v2,knowledge_v2,safety_v2 \
   --tokenize \
-  --max-chars 3890000000
+  --max-chars 3890000000 \
+  --out-dir data/processed
 ```
 
 - `--max-chars 3890000000` = 38.9 亿字符 ≈ **2.40B token**
-- `--clean-only general,depth`：**必须加**。只补洗 general 剩下的原始分片 + 清洗全新的 depth，
-  其余 4 类直接复用现成分片
-- **不要加 `--retrain-tokenizer`**：词表必须和 v1 一致（32768），重训会导致
-  和既有数据/推理脚本不匹配
-- 预计输出 `tokens.bin` ≈ **4.8GB**，`val_tokens.bin` ≈ 48MB
+- `--clean-only`：老类别（chat/knowledge/empathy/safety）已经洗完了，直接复用分片；
+  只清洗需要补量的 general/旧 depth 和全部 7 个新类别
+- **不要加 `--retrain-tokenizer`**：词表必须和 v1 一致（32768）
+- 输出 `tokens.bin` ≈ **4.8GB**，`val_tokens.bin` ≈ 48MB
+- 旧的 v1 数据集已备份到 `data/processed/_v1_backup/`
 
 > **为什么必须写 `--clean-only`**：`--reuse-shards` 续清洗要靠「最后写出的分片对应
 > 哪个原始文件」来猜进度。general 的原始目录没变过，猜得准；但 **chat 的原始目录
@@ -330,38 +349,47 @@ python -u src/train.py --stage sft --out-dir runs_v2 \
 
 ---
 
-## 九、数据补给：今晚不下，明早照旧开训
+## 九、数据补给：已下载并接入（2026-11-08 凌晨）
 
-**2026-11-07 23:40 实测本机网络：**
+### 9.1 带宽这关是怎么过的
 
-| 线路 | 实测 | 结论 |
-| --- | --- | --- |
-| huggingface.co 直连 | **完全不通**（连接超时 WinError 10060） | 用不了 |
-| hf-mirror.com | **0.15 MB/s** | 4.98GB 要 9.2 小时 |
+| 时间 | 线路 | 实测 | 结论 |
+| --- | --- | --- | --- |
+| 23:40 | huggingface.co 直连 | **完全不通**（WinError 10060） | 下不了 |
+| 23:40 | hf-mirror.com | 0.15 MB/s | 4.98GB 要 9.2 小时 |
+| 23:50（开代理后） | huggingface.co 直连 | **≈10 MB/s** | **4.98GB 用 15.9 分钟** |
 
-候选数据源已经核实并落盘（[docs/v2_data_sources.md](v2_data_sources.md)、
-[scripts/download_v2.py](../scripts/download_v2.py)，core 9 源 4.98GB ≈ 1.0B clean token，
-全部 gated=false 且尺寸经 HF tree API 精确求和）。
+结论：**网络是唯一瓶颈，通了就应该下。** 之前按 0.15MB/s 判断"不值得等"是错的。
 
-**但今晚下不完，也不该等它** —— 即使数据到了，重建 `tokens.bin` 还要 2.5~3.5h，
-赶不上明早开训。所以：
+### 9.2 实际下载 + 转换结果
 
-> **明早训练用本地数据（2.22B 可用，已经够训满 2.4B）。新数据下一轮再用。**
+`scripts/download_v2.py --preset core --endpoint hf` → **4.98GB / 15.9 分钟**，9 个源全部 gated=false。
 
-省下来的带宽可以先挂两块性价比最高的（后台跑，愿意就挂，不影响清洗）：
+`scripts/prepare_sources_v2.py --stage both` 把它们转成 Dreamy 类别（**输出到 `<类别>_v2/`，
+和旧分片物理隔离，不会覆盖老数据**）：
 
-```bash
-# 真实中文心理咨询多轮（0.74GB，约 82 分钟）
-# 价值：把 empathy 从「3.4 轮重复 keyword 过滤数据」换成真实咨询对话
-python -u scripts/download_v2.py --only \
-  counseling_cpsdd,counseling_psycheval,counseling_soulchat_r1,counseling_sage
+| 新类别 | 来源 | 条数 | 原始字符 | 估 token |
+| --- | --- | --- | --- | --- |
+| chat_v2 | shareAI/ShareGPT-Chinese-English-90k | 111,357 | 163.9M | 0.084B |
+| empathy_v2 | XuShihao6715/counseling-{cpsdd,psycheval,soulchat-r1,sage} | 84,913 | 130.9M | 0.067B |
+| depth_v2 | wangrui6/Zhihu-KOL | 1,002,295 | 756.1M | 0.39B |
+| knowledge_v2 | wikimedia/wikipedia 20231101.zh | 1,328,085 | 1050.5M | 0.54B |
+| safety_v2 | Skepsun/cvalues_rlhf | 79,157 | 22.9M | 0.012B |
 
-# 真实用户多轮对话（0.73GB，约 81 分钟）
-python -u scripts/download_v2.py --only sharegpt90k_zh
-```
+**SFT 阶段也顺带升级了**：新数据同时写进 `data/raw_sft/`（chat +111k、empathy +83k、
+depth +997k、boundary +78k），明晚 SFT 会用上真实咨询对话和真实用户多轮。
 
-下完不用管。下一轮重建数据集时，按 §4.2b 的方式加进 `mix.yaml` 和 `--clean-only` 即可。
-需要新写的 record adapter 共 5 处，都是机械改动，清单见 `docs/v2_data_sources.md` 末尾。
+### 9.3 新增/修改的代码
+
+| 文件 | 作用 |
+| --- | --- |
+| `scripts/download_v2.py` | 核实过的 9 源下载器，断点续传 + 官方/镜像自动切换 |
+| `scripts/prepare_sources_v2.py` | 5 类 record adapter（ShareGPT 的 `{human,assistant}`、咨询的 `client/counselor` 角色、知乎大写 `INSTRUCTION/RESPONSE`、CValues 的 `pos_resp`、维基文档 `text`） |
+| `configs/mix.yaml` | `pretrain_v2` 扩成 11 个类别，见 §3 |
+| `build_dataset_streaming.py` | 本轮新增 `--clean-only` / `--max-epochs` / 超采样 / `progress.json` 精确续清洗 |
+
+被拒的候选（126GB 实为语音数据、`gated=auto` 拿不到的、LCCC 换皮等）记录在
+[docs/v2_data_sources.md](v2_data_sources.md) 里，省得下次重复调研。
 
 ---
 
