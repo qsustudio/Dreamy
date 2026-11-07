@@ -245,6 +245,11 @@ def normalize(source: str, d):
             return None          # 个别仓库混了英文对话，直接丢
         turns = turns_from_messages(
             d.get("messages") or d.get("conversation") or d.get("dialogue"))
+        # 咨询记录几乎都以咨询师的问候开场（"您好,欢迎!"），而清洗规则要求
+        # user 先开口 —— 直接整条丢弃的话会掉 84%（实测 84,913 条只剩 6,018）。
+        # 这里只丢掉开场的咨询师回合，后面的十几轮全部保留。
+        while turns and turns[0]["role"] != "user":
+            turns.pop(0)
         return {"turns": turns} if len(turns) >= 2 else None
 
     # ---- ShareGPT 中文：conversation:[{human, assistant}] ----
