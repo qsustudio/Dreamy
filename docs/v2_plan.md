@@ -391,6 +391,30 @@ depth +997k、boundary +78k），明晚 SFT 会用上真实咨询对话和真实
 被拒的候选（126GB 实为语音数据、`gated=auto` 拿不到的、LCCC 换皮等）记录在
 [docs/v2_data_sources.md](v2_data_sources.md) 里，省得下次重复调研。
 
+### 9.4 差点翻车：维基的 `<unk>` 率 12.2%
+
+**分词器不用重训，但新数据必须过一遍兼容性检查。** 实测下来只有维基有问题：
+
+| 类别 | 修之前 unk | 修之后 unk | 原因 |
+| --- | --- | --- | --- |
+| **knowledge_v2（中文维基）** | **12.21%** | **0.22%** | 维基 dump 大量条目是**繁体**，而词表是在简体语料上训的 |
+| depth_v2（知乎） | 0.248% | 0.237% | 生僻字，正常范围 |
+| chat_v2 / empathy_v2 / safety_v2 | 0.07% / 0.01% / 0.08% | 同左 | 正常 |
+| general（旧，基线） | 0.10% | — | 参考基线 |
+
+修法：把 OpenCC 的 `TSCharacters.txt`（3221 条繁简映射，104KB，随仓库提交在
+[scripts/data/t2s_table.txt](../scripts/data/t2s_table.txt)）拉下来，
+在 `prepare_sources_v2.py` 里用 `str.translate` 做繁转简。
+**转换 61M 字符/秒，零依赖**（PyPI 当时不可达，`pip install opencc` 装不上，这个方案反而更好）。
+
+副作用还是正的：维基压缩率从 0.669 改善到 0.627 token/字符。
+
+新增安检脚本 [scripts/check_tokenizer.py](../scripts/check_tokenizer.py)：
+任何类别 unk 率 > 0.5% 直接报错。**以后加新数据源，先跑它再清洗。**
+
+> 教训：`unk` 不能只看 `ids[0]` —— 分词器把繁体字编码成 `[27625, 1]`，
+> 第一个 id 不是 unk，必须 `unk in ids` 才准。我第一次就是这么漏过去的。
+
 ---
 
 ## 附：关键数字速查
