@@ -74,13 +74,63 @@ step "创建虚拟环境"
 echo "  pip: $("$PY" -m pip --version)"
 
 # ---------------------------------------------------------------- 4. torch
-step "安装 PyTorch ${TORCH_VERSION}+${CUDA_TAG}"
+# PyPI 官方（pypi.org）在国内常常只有几十 KB/s，下载 2.5GB 的 torch wheel 会卡死。
+# 这里用「镜像优先 + 官方兜底 + 多轮重试」：镜像挂了就自动换官方，官方慢也没关系，
+# 因为镜像源在国内通常有几十 MB/s。
+step "安装 PyTorch ${TORCH_VERSION}+${CUDA_TAG}（镜像优先）"
 if "$PY" -c "import torch" 2>/dev/null; then
     "$PY" -c "import torch; print('  已安装:', torch.__version__)"
 else
-    "$PY" -m pip install --no-cache-dir "torch==${TORCH_VERSION}" \
-        --index-url "https://download.pytorch.org/whl/${CUDA_TAG}"
+    # torch 本体必须带 +cuXXX 后缀，否则会装成 CPU 版
+    TORCH_SPEC="torch==${TORCH_VERSION}+${CUDA_TAG}"
+    # 清华 / 阿里 / 北外 三个 PyPI 镜像都同步了 PyTorch 的 cu 索引
+    INDEXES=(
+        "https://mirrors.tuna.tsinghua.edu.cn/pytorch-wheels/${CUDA_TAG}"
+        "https://mirrors.aliyun.com/pytorch-wheels/${CUDA_TAG}"
+        "https://mirrors.bfsu.edu.cn/pytorch-wheels/${CUDA_TAG}"
+        "https://download.pytorch.org/whl/${CUDA_TAG}"
+    )
+    PYTORCH_INDEX="${PYTORCH_INDEX_OVERRIDE:-}"
+    if [ -n "$PYTORCH_INDEX" ]; then
+        INDEXES=("$PYTORCH_INDEX")
+        echo "  使用指定索引: $PYTORCH_INDEX"
+    fi
+
+    ok=0
+    for idx in "${INDEXES[@]}"; do
+        echo "  -> 尝试 $idx"
+        if "$PY" -m pip install --no-cache-dir --timeout 60 --retries 3 \
+                --index-url "$idx" \
+                --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+                "$TORCH_SPEC"; then
+            ok=1
+            break
+        fi
+        echo "  [!] 该源失败，换下一个"
+    done
+    if [ "$ok" -ne 1 ]; then
+        echo "  镜像都失败，退回 PyPI 官方（慢，可能要 20-40 分钟）"
+        "$PY" -m pip install --no-cache-dir --timeout 120 --retries 3 \
+            --index-url "https://download.pytorch.org/whl/${CUDA_TAG}" \
+            "$TORCH_SPEC" || die "torch 安装失败"
+    fi
+    "$PY" -c "import torch; print('  装好了:', torch.__version__)"
 fi
+
+# 装完必须验证：装成 CPU 版 / cu126 版都会让 5090 跑不起来
+"$PY" - <<'CHECK'
+import sys
+import torch
+if torch.version.cuda is None:
+    print("  [x] 装成了 CPU 版 torch，5090 跑不了"); sys.exit(1)
+if not torch.cuda.is_available():
+    print(f"  [x] CUDA 不可用（torch {torch.__version__}, cuda {torch.version.cuda}）")
+    sys.exit(1)
+cap = torch.cuda.get_device_capability(0)
+print(f"  CUDA {torch.version.cuda} | {torch.cuda.get_device_name(0)} | sm_{cap[0]}{cap[1]}")
+if cap[0] >= 12 and float(torch.version.cuda) < 12.8:
+    print("  [x] Blackwell(sm_120) 需要 CUDA >= 12.8"); sys.exit(1)
+CHECK
 
 # ---------------------------------------------------------------- 5. 依赖
 step "安装项目依赖"

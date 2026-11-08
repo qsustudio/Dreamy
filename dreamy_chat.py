@@ -164,10 +164,54 @@ class Dreamy:
         self.tok_pad = self.sp.pad_id()
 
     # ---------------------------------------------------------------- 生成
+    def _forward(self, idx: torch.Tensor, cache):
+        """带 KV cache 的前向。返回 (last_logits, new_cache)。
+
+        没有 cache 时整段重算；有 cache 时只喂新加的那几个 token，
+        注意力直接复用之前算好的 K/V。
+
+        以前这里是每次 `self.model(x)[0, -1]` 把整段重跑一遍：
+        生成第 150 个 token 时要把前 150 个 token 全部重新计算，
+        CPU 上一句话要等 30-60 秒。加了 cache 之后快一个数量级。
+
+        x-transformers 的 cache 是一个 `LayerIntermediates` 对象，
+        它自带 `cache_length`（已经缓存了多少个 token），下次调用把它原样传回去即可。
+        """
+        n_past = int(getattr(cache, "cache_length", 0) or 0)
+        inp = idx[:, n_past:] if n_past else idx
+        if inp.shape[1] == 0:
+            return None, cache
+        with torch.no_grad():
+            logits, new_cache = self.model(
+                inp, cache=cache, return_intermediates=True,
+            )
+        return logits[:, -1].float(), new_cache
+
+    def _sample(self, logits: torch.Tensor, seen_tokens,
+                temp: float, top_p: float, rep_pen: float) -> int:
+        logits = logits.clone()
+        if rep_pen != 1.0:
+            idx = torch.tensor(list(seen_tokens), device=logits.device,
+                               dtype=torch.long)
+            idx = idx[idx < logits.numel()]
+            if idx.numel():
+                logits[idx] /= rep_pen
+
+        logits = logits / max(temp, 1e-6)
+        probs = torch.softmax(logits, dim=-1)
+
+        sorted_p, sorted_i = torch.sort(probs, descending=True)
+        cum = torch.cumsum(sorted_p, dim=-1)
+        n_keep = min(max(int((cum <= top_p).sum()) + 1, 1), sorted_i.numel())
+        cand_i = sorted_i[:n_keep]
+        cand_p = probs[cand_i]
+        cand_p = cand_p / cand_p.sum()
+        return int(cand_i[torch.multinomial(cand_p, 1)])
+
     def respond(self, question: str, history: list[int] | None = None,
                 max_new: int = MAX_NEW, temp: float = TEMP,
                 top_p: float = TOP_P, rep_pen: float = REP_PEN,
-                seed: int | None = None) -> str:
+                seed: int | None = None, use_cache: bool = True) -> str:
         if seed is not None:
             torch.manual_seed(seed)
 
@@ -175,39 +219,33 @@ class Dreamy:
         cur = [self.tok_user] + self.sp.encode(question) + [self.tok_asst]
         full = [self.tok_user] + history + cur
 
-        # 超出上下文就砍掉最早的对话（保留当前这轮）
         while len(full) > CTX_LIMIT and len(history) > 2:
             history = history[2:]
             full = [self.tok_user] + history + cur
 
         x = torch.tensor([full], device=self.device)
         out_ids: list[int] = []
+        seen = set(x[0].tolist())
+        cache = None
+        new_tok = torch.empty((1, 1), dtype=torch.long, device=self.device)
 
         for _ in range(max_new):
-            with torch.no_grad():
-                logits = self.model(x)[0, -1].float()
+            if use_cache:
+                logits, cache = self._forward(x, cache)
+                if logits is None:
+                    break
+            else:
+                with torch.no_grad():
+                    logits = self.model(x)[0, -1].float()
 
-            # 重复惩罚：已出现过的 token 概率压低
-            for t in set(x[0].tolist()):
-                logits[t] /= rep_pen
-
-            logits = logits / temp
-            probs = torch.softmax(logits, dim=-1)
-
-            # top-p 截断（保证至少留 1 个候选）
-            sorted_p, sorted_i = torch.sort(probs, descending=True)
-            cum = torch.cumsum(sorted_p, dim=-1)
-            n_keep = min(max(int((cum <= top_p).sum()) + 1, 1),
-                         sorted_i.numel())
-            cand_i = sorted_i[:n_keep]
-            cand_p = probs[cand_i]
-            cand_p = cand_p / cand_p.sum()
-            nxt = int(cand_i[torch.multinomial(cand_p, 1)])
+            nxt = self._sample(logits.squeeze(0), seen, temp, top_p, rep_pen)
 
             if nxt in (self.tok_end, self.tok_pad, self.tok_user):
                 break
             out_ids.append(nxt)
-            x = torch.cat([x, torch.tensor([[nxt]], device=self.device)], dim=1)
+            seen.add(nxt)
+            new_tok.fill_(nxt)
+            x = torch.cat([x, new_tok], dim=1)
 
         return self.sp.decode(out_ids)
 
