@@ -162,6 +162,13 @@ class Dreamy:
         self.tok_asst = self.sp.piece_to_id("<|assistant|>")
         self.tok_end = self.sp.piece_to_id("<|end_of_message|>")
         self.tok_pad = self.sp.pad_id()
+        # 特殊 token 占 id 0~7（pad/unk/bos + 4 个自定义标记），
+        # 重复惩罚要跳过这一段，否则会把 stop token 压得发不出来。
+        self.special_floor = max(
+            self.tok_pad, self.sp.unk_id(), self.sp.bos_id(),
+            *[self.sp.piece_to_id(t) for t in
+              ("<|system|>", "<|user|>", "<|assistant|>", "<|end_of_message|>")]
+        ) + 1
 
     # ---------------------------------------------------------------- 生成
     def _forward(self, idx: torch.Tensor, cache):
@@ -189,13 +196,26 @@ class Dreamy:
 
     def _sample(self, logits: torch.Tensor, seen_tokens,
                 temp: float, top_p: float, rep_pen: float) -> int:
-        logits = logits.clone()
-        if rep_pen != 1.0:
-            idx = torch.tensor(list(seen_tokens), device=logits.device,
+        """采样下一个 token。
+
+        ⚠️ 重复惩罚只作用在「已经**生成**出来的 token」上（由调用方传进来），
+        绝不能把 prompt 里出现的 token 也算进去：
+
+            logits[idx] /= rep_pen     # idx 里混了 <|user|> / <|assistant|> 等特殊 token
+
+        特殊 token 的 logits 被 /= 1.25 之后，从没出现过的 <unk>(id=1) 反而
+        相对被抬高，模型就开始往外吐 ⁇ ⁇ ⁇ —— 这就是之前满屏乱码的直接原因。
+        另外这里改成减法形式（logit - (rep_pen-1)），比起除法，
+        对 logits 量级不敏感，也不会把负 logits 推向 -inf。
+        """
+        if rep_pen != 1.0 and seen_tokens:
+            idx = torch.tensor(sorted(seen_tokens), device=logits.device,
                                dtype=torch.long)
-            idx = idx[idx < logits.numel()]
+            # 只惩罚词表内的普通 token，特殊 token 不参与
+            idx = idx[(idx >= self.special_floor) & (idx < logits.numel())]
             if idx.numel():
-                logits[idx] /= rep_pen
+                logits = logits.clone()
+                logits[idx] -= (rep_pen - 1.0)
 
         logits = logits / max(temp, 1e-6)
         probs = torch.softmax(logits, dim=-1)
@@ -225,7 +245,8 @@ class Dreamy:
 
         x = torch.tensor([full], device=self.device)
         out_ids: list[int] = []
-        seen = set(x[0].tolist())
+        # 只有**生成出来**的 token 参与重复惩罚；prompt 里的不动
+        seen: set[int] = set()
         cache = None
         new_tok = torch.empty((1, 1), dtype=torch.long, device=self.device)
 
