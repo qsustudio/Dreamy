@@ -86,6 +86,24 @@ fi
 step "安装项目依赖"
 "$PY" -m pip install --no-cache-dir -r "$ROOT/requirements.txt"
 
+# ---------------------------------------------------------------- 5b. x-transformers
+# 不从 PyPI 装：仓库内自带 vendor/x_transformers/（和开发机同一份源码）。
+# pip 装会拿到可能更旧的版本，而 v1.1 依赖 attn_flash / attn_qk_norm /
+# zero_init_branch_output —— 版本不对会在 build_model 时直接 TypeError。
+step "安装 x-transformers（仓库内自带版本）"
+VENDOR="$ROOT/vendor"
+if [ ! -d "$VENDOR/x_transformers" ]; then
+    die "找不到 $VENDOR/x_transformers，仓库不完整（请 git clone 完整仓库）"
+fi
+SP="$("$PY" -c 'import site; print(site.getsitepackages()[0])')"
+rm -rf "$SP/x_transformers" "$SP"/x_transformers-*.dist-info 2>/dev/null || true
+echo "$VENDOR" > "$SP/_dreamy_vendor.pth"
+"$PY" -c "import x_transformers, os; print('  x_transformers:', x_transformers.__file__)"
+case "$("$PY" -c 'import x_transformers; print(x_transformers.__file__)')" in
+    "$VENDOR"/*) echo "  -> 已指向 vendor/" ;;
+    *) die "x-transformers 没有指到 vendor/，请检查 site-packages 里是否有残留版本" ;;
+esac
+
 # ---------------------------------------------------------------- 6. 自检
 step "环境自检"
 cd "$ROOT"

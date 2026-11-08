@@ -8,8 +8,15 @@
 #   这样避免 requirements 把 torch 钉死成某个 CUDA 构建。
 
 # ---- 核心模型库 ----
-# x-transformers：锁定版本，避免上游 API 快速变动导致 Colab 行为不一致
-x-transformers==2.31.11
+# x-transformers：**不从 PyPI 装**，用仓库内自带的 vendor/x_transformers/
+#   （0.42MB，和开发机跑的是同一份源码）
+#   原因：
+#     1) v1.1 依赖 attn_flash / attn_qk_norm / zero_init_branch_output，
+#        旧版本没有这些参数，装错版本会在 build_model 时直接 TypeError
+#     2) PyPI 在国内经常不可达（实测 pip install 卡 8 分钟没动静）
+#     3) 训练只有一次机会，不能赌「版本应该差不多」
+#   安装由 _deploy/setup_5090.sh 负责：往 site-packages 写一个 .pth 指向 vendor/
+# x-transformers==2.31.11
 
 # 它的运行时依赖（pip 会自动带，这里显式列出便于审查）
 einx>=0.3.0

@@ -10,10 +10,15 @@ venv/
 env/
 ENV/
 
-# ---------------- 第三方库源码（用 pip 安装，不作为项目代码提交）----------------
-# x-transformers 是 lucidrains 的库，通过 requirements.txt 安装
+# ---------------- 第三方库源码 ----------------
+# 完整 clone（含 examples/tests，39MB）不入库
 x-transformers/
-vendor/
+# 但 vendor/ 下只提交 x_transformers 源码包本身（0.42MB / 23 文件）：
+# 训练机和开发机必须跑**完全同一份** x-transformers，否则
+# attn_flash / attn_qk_norm 这些参数对不上会直接 TypeError。
+vendor/*
+!vendor/x_transformers/
+!vendor/x_transformers/**
 
 # ---------------- Python 缓存 / 构建产物 ----------------
 __pycache__/
