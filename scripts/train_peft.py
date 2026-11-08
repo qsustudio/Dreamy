@@ -116,15 +116,24 @@ def build_lora(model, rank: int, alpha: float):
                 p.requires_grad = False
             self.r = r
             self.scale = a / r
-            self.lora_a = tnn.Parameter(torch.zeros(r, base.in_features))
-            self.lora_b = tnn.Parameter(torch.zeros(base.out_features, r))
+            # 新参数默认建在 CPU 上，必须跟着 base 一起放到同一设备，
+            # 否则前向会报 "mat2 is on cpu, different from other tensors on cuda"。
+            dev = base.weight.device
+            dt = base.weight.dtype
+            self.lora_a = tnn.Parameter(torch.zeros(r, base.in_features,
+                                                    device=dev, dtype=dt))
+            self.lora_b = tnn.Parameter(torch.zeros(base.out_features, r,
+                                                    device=dev, dtype=dt))
             # A 用高斯初始化、B 用 0：初始时 LoRA 分支输出恒为 0，不破坏基座
             tnn.init.normal_(self.lora_a, std=1.0 / math.sqrt(base.in_features))
             tnn.init.zeros_(self.lora_b)
 
         def forward(self, x):
             out = self.base(x)
-            lora = (x @ self.lora_a.T) @ self.lora_b.T
+            # 权重用 bf16/半精度时，把计算统一到输入 dtype，避免 mm dtype 不一致
+            a = self.lora_a.to(x.dtype)
+            b = self.lora_b.to(x.dtype)
+            lora = (x @ a.T) @ b.T
             return out + lora * self.scale
 
     for module in model.modules():
@@ -225,7 +234,10 @@ def main(argv=None) -> int:
         return 0
 
     # ---- LoRA 微调 ----
+    # 注意顺序：必须在 model.to(device) 之后注入，新参数才会继承基座的设备；
+    # 保险起见再调一次 to(device)。
     model, n_wrapped = build_lora(model, args.rank, args.alpha)
+    model.to(device)
     trainable = [p for p in model.parameters() if p.requires_grad]
     n_train = sum(p.numel() for p in trainable)
     n_all = sum(p.numel() for p in model.parameters())
